@@ -1,0 +1,31 @@
+{
+  "results": {
+    "gsm8k": {
+      "alias": "gsm8k",
+      "exact_match,strict-match": 0.802,
+      "exact_match_stderr,strict-match": 0.011,
+      "exact_match,flexible-extract": 0.815,
+      "exact_match_stderr,flexible-extract": 0.011
+    },
+    "arc_challenge": {
+      "alias": "arc_challenge",
+      "acc,none": 0.601,
+      "acc_stderr,none": 0.014,
+      "acc_norm,none": 0.63,
+      "acc_norm_stderr,none": 0.014
+    },
+    "hellaswag": {
+      "alias": "hellaswag",
+      "acc_norm,none": 0.55,
+      "acc_norm_stderr,none": 0.02,
+      "acc,none": 0.42,
+      "acc_stderr,none": 0.015
+    },
+    "wikitext": {
+      "alias": "wikitext",
+      "word_perplexity,none": 9.87,
+      "byte_perplexity,none": 1.55,
+      "bits_per_byte,none": 0.63
+    }
+  }
+}

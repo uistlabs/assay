@@ -1,0 +1,12 @@
+# Keep the build context small: pip install -e . needs only pyproject.toml + src/.
+# Exclude the heavy/irrelevant so `COPY . /app` doesn't drag GBs of venv/git in.
+.venv/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+checkpoints/
+*.safetensors
+docs/

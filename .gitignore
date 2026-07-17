@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+# secrets -- never commit
+*.env
+.env*
+secrets/
+# heavy artifacts -- never commit checkpoints
+checkpoints/
+*.safetensors
+
+# ephemeral operator scratch (pod ids, launch retries) -- never commit
+scratchpad*
