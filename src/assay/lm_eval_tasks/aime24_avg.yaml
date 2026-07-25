@@ -1,0 +1,41 @@
+# assay-owned avg@K variant of aime24. Self-contained (inlines the stock aime24
+# config rather than `include: aime24.yaml`): lm-eval 0.4.12 resolves a relative
+# include only within the including file's OWN directory, never across an
+# include_path root, so an include of the packaged stock task silently drops this
+# task from the index. Only the avg@K bits differ from stock: a custom pass-through
+# filter (keep all K samples; stock default take_first discards all but the first)
+# and an averaging process_results. K (repeats) is injected at runtime from the
+# recipe (evaluate.py), not baked here. Metric key is `exact_match,avg` (filter name).
+tag:
+  - math_word_problems
+task: aime24_avg
+dataset_path: Maxwell-Jia/AIME_2024
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: train
+doc_to_text: "Question: {{Problem}}\nAnswer:"
+doc_to_target: "{{Answer}}"
+process_results: !function utils.avg_process_results
+filter_list:
+  - name: "avg"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.passthrough
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+generation_kwargs:
+  until:
+    - "Question:"
+    - "</s>"
+    - "<|im_end|>"
+    - "<|eot_id|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 32768
+repeats: 1
+num_fewshot: 0
+metadata:
+  version: 1.0

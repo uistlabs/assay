@@ -1,3 +1,8 @@
+def test_version_is_0_5_0():
+    import assay
+    assert assay.__version__ == "0.5.1"
+
+
 def test_quantize_imports_and_recipe_constructs():
     from llmcompressor.modifiers.quantization import QuantizationModifier
     recipe = QuantizationModifier(targets="Linear", scheme="NVFP4", ignore=["lm_head"])
@@ -15,7 +20,7 @@ def test_module_entrypoint_invokes_main():
     """`python -m assay.job` (exactly what pod_entry.sh runs) must actually call
     main(). Regression: job.py defined main() but lacked the `if __name__ ==
     "__main__"` guard, so -m imported the module and exited 0 without running
-    anything -- on the pod the EXIT-trap teardown then self-terminated it, so the
+    anything - on the pod the EXIT-trap teardown then self-terminated it, so the
     whole job silently no-op'd. This asserts the entrypoint is wired.
 
     Env is crafted so main() -> load_config() trips the I2 output_dir guard
@@ -31,7 +36,7 @@ def test_module_entrypoint_invokes_main():
         "ASSAY_HEARTBEAT": "/tmp/assay-entrypoint-test/hb.log",
         # heartbeat/artifacts nested in output_dir -> load_config raises ValueError
         "ASSAY_OUTPUT_DIR": "/tmp/assay-entrypoint-test",
-        # required since B7 -- must be set so Config construction reaches the I2
+        # required since B7 - must be set so load_config reaches the I2
         # guard this test asserts, instead of raising on the missing key first.
         "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     }
@@ -40,7 +45,7 @@ def test_module_entrypoint_invokes_main():
         capture_output=True, text=True, env=env,
     )
     assert proc.returncode != 0, (
-        "python -m assay.job exited 0 -- main() was never invoked "
+        "python -m assay.job exited 0 - main() was never invoked "
         "(missing `if __name__ == \"__main__\"` guard in job.py)"
     )
     assert "must not contain" in proc.stderr, proc.stderr

@@ -7,7 +7,7 @@ Latest-stable coherent stack, pinned exactly and bumped as a unit:
 | component | version | role |
 |-----------|---------|------|
 | vLLM | 0.25.0 (cu129 wheel, torch 2.11) | reader / eval engine (Blackwell sm_120, no cu130 driver floor) |
-| torch | 2.11.0+cu129 | -- |
+| torch | 2.11.0+cu129 | - |
 | llmcompressor | 0.12.0 | writer (NVFP4 quantization) |
 | compressed-tensors | 0.17.1 | NVFP4 on-disk format contract (shared write + read) |
 
@@ -18,7 +18,7 @@ both sides and validate load-correctness on metal (the build gate documents this
 
 Build + push:
 
-    podman build -t ghcr.io/uistlabs/assay:0.2.0 -f deploy/Dockerfile .
-    podman push ghcr.io/uistlabs/assay:0.2.0
+    podman build -t ghcr.io/uistlabs/assay:0.5.1 -f deploy/Dockerfile .
+    podman push ghcr.io/uistlabs/assay:0.5.1
 
-Weights are NOT baked -- they mount from a pre-staged RunPod network volume at runtime.
+Weights are NOT baked - they mount from a pre-staged RunPod network volume at runtime.

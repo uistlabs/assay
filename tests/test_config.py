@@ -1,26 +1,49 @@
 import pytest
 
 from assay.config import (
-    Config,
-    MIN_MEAN_RETENTION,
-    MAX_SINGLE_DROP_PTS,
-    MAX_PPL_INCREASE,
+    DEFAULT_GATE,
+    GateThresholds,
+    RunConfig,  # noqa: F401 - imported to assert the public name exists
     load_config,
     require_secret,
 )
 
 
-def test_defaults_match_spec():
-    cfg = load_config({"ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    assert cfg.base_model == "Qwen/Qwen2.5-7B-Instruct"
-    assert cfg.calib_dataset == "HuggingFaceH4/ultrachat_200k"
-    assert cfg.num_calibration_samples == 512
-    assert cfg.max_seq_length == 2048
-    assert "gsm8k" in cfg.accuracy_tasks
-    assert cfg.perplexity_task == "wikitext"
+def _env(**kw):
+    return {"ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16", **kw}
 
 
-def test_checkpoint_repo_is_required():
+def test_default_recipe_is_qwen():
+    cfg = load_config(_env())
+    assert cfg.recipe.slug == "qwen2_5_7b_instruct"
+    assert cfg.recipe.base_model == "Qwen/Qwen2.5-7B-Instruct"
+    assert cfg.recipe.calib.num_samples == 512
+    assert cfg.recipe.perplexity_task_name == "wikitext"
+
+
+def test_select_recipe_by_env():
+    cfg = load_config(_env(ASSAY_RECIPE="r1_distill_qwen_7b"))
+    assert cfg.recipe.slug == "r1_distill_qwen_7b"
+
+
+def test_unknown_recipe_raises():
+    with pytest.raises(KeyError, match="unknown recipe"):
+        load_config(_env(ASSAY_RECIPE="nope"))
+
+
+def test_scalar_env_overrides_recipe_field():
+    cfg = load_config(_env(ASSAY_NUM_CALIB="8", ASSAY_BASE_MODEL="foo/bar"))
+    assert cfg.recipe.calib.num_samples == 8
+    assert cfg.recipe.base_model == "foo/bar"
+
+
+def test_quant_scheme_default_and_override():
+    # Default is the weight-only W4A16 variant after the W4A4 gate fail.
+    assert load_config(_env()).recipe.quant_scheme == "NVFP4A16"
+    assert load_config(_env(ASSAY_QUANT_SCHEME="NVFP4")).recipe.quant_scheme == "NVFP4"
+
+
+def test_checkpoint_repo_required():
     with pytest.raises(ValueError, match="ASSAY_CHECKPOINT_REPO"):
         load_config({})
 
@@ -30,16 +53,44 @@ def test_checkpoint_repo_read_from_env():
     assert cfg.checkpoint_repo == "myorg/My-Model-NVFP4A16"
 
 
+def test_gpu_mem_util_default_and_override():
+    assert load_config(_env()).gpu_mem_util == 0.85
+    assert load_config(_env(ASSAY_GPU_MEM_UTIL="0.70")).gpu_mem_util == 0.70
+
+
+def test_default_gate_thresholds():
+    assert DEFAULT_GATE == GateThresholds(0.99, 2.0, 0.03)  # 0.03 loosened from 0.01 on metal
+
+
+def test_config_never_holds_secrets():
+    cfg = load_config(_env(RUNPOD_API_KEY="sekret", HF_TOKEN="sekret"))
+    assert "sekret" not in repr(cfg)
+
+
 def test_artifacts_dir_and_output_dir_are_separate():
     # I1/I2: ops artifacts (heartbeat, eval JSONs, delta table) must live OUTSIDE
     # the published checkpoint dir, so a publish (which uploads output_dir) can
-    # never sweep them up.
+    # never sweep them up. artifacts_dir and output_dir are SIBLINGS (neither
+    # nests inside the other) so that publish_artifacts (which uploads
+    # artifacts_dir wholesale to the private run-artifacts dataset) can never
+    # sweep the multi-GB checkpoint into it either (SP1 whole-branch review fix).
     cfg = load_config({"ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    assert cfg.artifacts_dir == "/runpod-volume/assay-out"
+    assert cfg.artifacts_dir == "/runpod-volume/assay-out/artifacts"
     assert cfg.output_dir == "/runpod-volume/assay-out/checkpoint"
-    assert cfg.heartbeat_path == "/runpod-volume/assay-out/heartbeat.log"
+    assert cfg.heartbeat_path == "/runpod-volume/assay-out/artifacts/heartbeat.log"
     assert not cfg.heartbeat_path.startswith(cfg.output_dir)
-    assert cfg.output_dir.startswith(cfg.artifacts_dir)
+    assert not cfg.output_dir.startswith(cfg.artifacts_dir + "/")
+    assert not cfg.artifacts_dir.startswith(cfg.output_dir + "/")
+
+
+def test_default_output_dir_and_artifacts_dir_are_siblings():
+    # The structural invariant that prevents publish_artifacts from sweeping the
+    # multi-GB checkpoint into the private run-artifacts upload: under the
+    # DEFAULT config, output_dir and artifacts_dir must be siblings - neither
+    # contains the other.
+    cfg = load_config({"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16"})
+    assert not cfg.output_dir.startswith(cfg.artifacts_dir + "/")
+    assert not cfg.artifacts_dir.startswith(cfg.output_dir + "/")
 
 
 def test_artifacts_dir_env_override():
@@ -48,48 +99,6 @@ def test_artifacts_dir_env_override():
         "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     assert cfg.artifacts_dir == "/tmp/ops"
-
-
-def test_env_overrides():
-    cfg = load_config({
-        "ASSAY_BASE_MODEL": "foo/bar",
-        "ASSAY_NUM_CALIB": "8",
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
-    })
-    assert cfg.base_model == "foo/bar"
-    assert cfg.num_calibration_samples == 8
-
-
-def test_gpu_mem_util_default_and_override():
-    assert load_config({"ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"}).gpu_mem_util == 0.85
-    assert load_config({
-        "ASSAY_GPU_MEM_UTIL": "0.70",
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
-    }).gpu_mem_util == 0.70
-
-
-def test_quant_scheme_default_and_override():
-    # Default is the weight-only W4A16 variant after the W4A4 gate fail.
-    assert load_config({"ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"}).quant_scheme == "NVFP4A16"
-    assert load_config({
-        "ASSAY_QUANT_SCHEME": "NVFP4",
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
-    }).quant_scheme == "NVFP4"
-
-
-def test_gate_thresholds():
-    assert MIN_MEAN_RETENTION == 0.99
-    assert MAX_SINGLE_DROP_PTS == 2.0
-    assert MAX_PPL_INCREASE == 0.03  # loosened from 0.01 on metal evidence
-
-
-def test_config_never_holds_secrets():
-    cfg = load_config({
-        "RUNPOD_API_KEY": "sekret",
-        "HF_TOKEN": "sekret",
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
-    })
-    assert "sekret" not in repr(cfg)
 
 
 def test_require_secret_present():
@@ -108,10 +117,24 @@ def test_require_secret_missing_raises():
 
 
 def test_load_config_defaults_pass_the_i2_guard():
-    # Safe layout: output_dir is a subdir of artifacts_dir, so ops artifacts
-    # (which live in artifacts_dir/heartbeat_path) are never inside output_dir.
+    # Safe layout: output_dir and artifacts_dir are siblings, so ops artifacts
+    # (which live under artifacts_dir) are never inside output_dir, and the
+    # checkpoint (in output_dir) is never inside artifacts_dir.
     cfg = load_config({"ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
     assert cfg  # no raise
+
+
+def test_output_dir_nested_in_artifacts_dir_raises():
+    # The bidirectional half of the I2 guard (SP1 whole-branch review fix):
+    # publish_artifacts uploads artifacts_dir wholesale to the PRIVATE
+    # run-artifacts dataset, so a checkpoint nested inside artifacts_dir would
+    # be swept into that upload every run, blowing the 300s timeout.
+    with pytest.raises(ValueError, match="must not be nested inside"):
+        load_config({
+            "ASSAY_ARTIFACTS_DIR": "/vol/a",
+            "ASSAY_OUTPUT_DIR": "/vol/a/checkpoint",
+            "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        })
 
 
 def test_stale_output_dir_equal_to_artifacts_dir_raises():
@@ -143,3 +166,123 @@ def test_custom_disjoint_layout_does_not_raise():
     })
     assert cfg.artifacts_dir == "/tmp/ops"
     assert cfg.output_dir == "/tmp/checkpoint"
+
+
+def test_gate_thresholds_fields_are_optional():
+    g = GateThresholds(min_mean_retention=None, max_single_drop_pts=None,
+                       max_ppl_increase=0.03, k_stderr=2.0)
+    assert g.min_mean_retention is None
+    assert g.max_single_drop_pts is None
+    assert g.max_ppl_increase == 0.03
+    assert g.k_stderr == 2.0
+
+
+def test_default_gate_unchanged_and_k_stderr_defaults_none():
+    assert DEFAULT_GATE.min_mean_retention == 0.99
+    assert DEFAULT_GATE.max_single_drop_pts == 2.0
+    assert DEFAULT_GATE.max_ppl_increase == 0.03
+    assert DEFAULT_GATE.k_stderr is None
+
+
+def test_tier_defaults_to_cert():
+    cfg = load_config({"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16"})
+    assert cfg.tier == "cert"
+    assert cfg.eval_limit is None
+
+
+def test_tier_dev_and_smoke_case_insensitive():
+    base = {"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16"}
+    assert load_config({**base, "ASSAY_TIER": "dev"}).tier == "dev"
+    assert load_config({**base, "ASSAY_TIER": "DEV"}).tier == "dev"
+    assert load_config({**base, "ASSAY_TIER": "smoke"}).tier == "smoke"
+    assert load_config({**base, "ASSAY_TIER": ""}).tier == "cert"  # empty -> full run
+
+
+def test_tier_unknown_raises():
+    import pytest
+    with pytest.raises(ValueError, match="ASSAY_TIER"):
+        load_config({"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16", "ASSAY_TIER": "prod"})
+
+
+def test_eval_limit_from_tier_and_override():
+    base = {"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16"}
+    assert load_config({**base, "ASSAY_TIER": "dev"}).eval_limit == 50
+    assert load_config({**base, "ASSAY_TIER": "smoke"}).eval_limit == 2
+    assert load_config({**base, "ASSAY_TIER": "dev", "ASSAY_LIMIT": "10"}).eval_limit == 10
+
+
+def test_eval_limit_one_refused():
+    import pytest
+    with pytest.raises(ValueError, match="limit == 1"):
+        load_config({"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16", "ASSAY_LIMIT": "1"})
+
+
+def test_eval_limit_zero_refused():
+    # Tightened alongside the pristine guard: an effective limit < 2 (not just the
+    # literal 1) must be refused - 0/negative would evaluate nothing (or crash the
+    # same significance-gate math as limit=1) while still matching cert tier.
+    import pytest
+    with pytest.raises(ValueError, match="limit == 0"):
+        load_config({"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16", "ASSAY_LIMIT": "0"})
+
+
+def test_heartbeat_defaults_under_artifacts_dir():
+    from assay.config import load_config
+    cfg = load_config({
+        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_ARTIFACTS_DIR": "/vol/assay-out/artifacts/pod-xyz",
+    })
+    assert cfg.heartbeat_path == "/vol/assay-out/artifacts/pod-xyz/heartbeat.log"
+
+
+def test_explicit_heartbeat_still_wins():
+    from assay.config import load_config
+    cfg = load_config({
+        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_ARTIFACTS_DIR": "/vol/art",
+        "ASSAY_HEARTBEAT": "/custom/hb.log",
+    })
+    assert cfg.heartbeat_path == "/custom/hb.log"
+
+
+def test_calib_override_breaks_pristine_even_on_cert_tier():
+    # RED (the guard's reason to exist): a cert-tier run with a calib override reflects
+    # a DIFFERENT quantization than the recipe - publishing it would mint a cert that
+    # lies. Tier-gating alone (Task 1) misses this: tier is still "cert". Pristine catches it.
+    cfg = load_config({"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16", "ASSAY_NUM_CALIB": "8"})
+    assert cfg.tier == "cert"
+    assert cfg.pristine is False
+
+
+def test_pristine_true_only_for_unmodified_cert_run():
+    assert load_config({"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16"}).pristine is True
+
+
+@pytest.mark.parametrize("var,val", [
+    ("ASSAY_CALIB_DATASET", "wikitext"),
+    ("ASSAY_CALIB_SPLIT", "train"),
+    ("ASSAY_NUM_CALIB", "8"),
+    ("ASSAY_MAX_SEQ_LEN", "1024"),
+    ("ASSAY_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct"),
+    ("ASSAY_QUANT_SCHEME", "NVFP4A16"),
+    ("ASSAY_LIMIT", "10"),
+    ("ASSAY_INJECT_STALL_AFTER", "60"),
+])
+def test_each_recognized_override_breaks_pristine(var, val):
+    cfg = load_config({"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16", var: val})
+    assert cfg.pristine is False, var
+
+
+def test_dev_and_smoke_tiers_are_not_pristine():
+    base = {"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16"}
+    assert load_config({**base, "ASSAY_TIER": "dev"}).pristine is False
+    assert load_config({**base, "ASSAY_TIER": "smoke"}).pristine is False
+
+
+def test_retired_assay_smoke_is_inert():
+    # ASSAY_SMOKE is retired (MOVE 2): a stale one must NOT enable the old smoke tier -
+    # it is simply ignored, so the run is a normal full cert (tier=cert, pristine=True).
+    # Guards against a lingering reference silently resurrecting the old knob.
+    cfg = load_config({"ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16", "ASSAY_SMOKE": "1"})
+    assert cfg.tier == "cert"
+    assert cfg.pristine is True

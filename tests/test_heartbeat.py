@@ -68,3 +68,17 @@ def test_emit_is_ascii(tmp_path):
     hb = Heartbeat(str(p))
     hb.emit("done", "ok")
     assert p.read_text().isascii()
+
+
+def test_emit_is_thread_safe(tmp_path):
+    import threading
+    from assay.heartbeat import Heartbeat
+    hb = Heartbeat(str(tmp_path / "hb.log"))
+    def worker():
+        for _ in range(50):
+            hb.emit("t", "x")
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    lines = [ln for ln in (tmp_path / "hb.log").read_text().splitlines() if ln]
+    assert len(lines) == 200  # no interleaved/dropped lines

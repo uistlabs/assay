@@ -1,8 +1,8 @@
-"""assay.job.assert_gpu_available -- the fail-fast GPU guard.
+"""assay.job.assert_gpu_available - the fail-fast GPU guard.
 
 Added after the CUDA-804 metal RCA: on the nvidia/cuda base, cuda-compat raised CUDA
 error 804 on a consumer 5090, torch reported zero devices, and llm-compressor
-SILENTLY fell back to CPU -- 35 min of paid CPU calibration on a rented pod. The
+SILENTLY fell back to CPU - 35 min of paid CPU calibration on a rented pod. The
 guard must fail LOUD instead. torch is faked here so the paths are deterministic on
 any host (CI has no GPU; the dev box's 1070 can't run the Blackwell wheel)."""
 

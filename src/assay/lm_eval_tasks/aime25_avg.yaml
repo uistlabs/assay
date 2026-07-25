@@ -1,0 +1,35 @@
+# assay-owned avg@K variant of aime25. Self-contained; see aime24_avg.yaml for the
+# design note on why the stock config is inlined rather than included.
+tag:
+  - math_word_problems
+task: aime25_avg
+dataset_path: math-ai/aime25
+output_type: generate_until
+training_split: test
+fewshot_split: test
+test_split: test
+doc_to_text: "Question: {{problem}}\nAnswer:"
+doc_to_target: "{{answer}}"
+process_results: !function utils.avg_process_results
+filter_list:
+  - name: "avg"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.passthrough
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+generation_kwargs:
+  until:
+    - "Question:"
+    - "</s>"
+    - "<|im_end|>"
+    - "<|eot_id|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 32768
+repeats: 1
+num_fewshot: 0
+metadata:
+  version: 1.0

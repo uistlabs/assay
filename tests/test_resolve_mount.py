@@ -1,27 +1,26 @@
 """resolve_mount rebases volume paths to wherever the weights actually mount.
 
 Regression: assay is the first pod-based consumer of a RunPod network volume.
-Pods can mount it at /workspace, not the /runpod-volume the config defaulted to
--- so a hardcoded mount base stranded the job (weights not found -> fast fail ->
+Pods can mount it at /workspace, not the /runpod-volume the config defaulted to -
+so a hardcoded mount base stranded the job (weights not found -> fast fail ->
 pod self-terminated ~6 min with no output)."""
-from assay.config import Config, resolve_mount
+from assay.config import RunConfig, resolve_mount
+from assay.recipes import get_recipe
 
 _BASE = dict(
-    base_model="Qwen/Qwen2.5-7B-Instruct",
-    calib_dataset="d", calib_split="s", num_calibration_samples=8, max_seq_length=2048,
-    quant_scheme="NVFP4A16", gpu_mem_util=0.85,
-    accuracy_tasks=("arc_challenge",), perplexity_task="wikitext",
+    recipe=get_recipe("qwen2_5_7b_instruct"),
     checkpoint_repo="uistlabs/x",
     pipeline_url="",
     weights_path="/runpod-volume/qwen2.5-7b-instruct",
-    artifacts_dir="/runpod-volume/assay-out",
+    artifacts_dir="/runpod-volume/assay-out/artifacts",
     output_dir="/runpod-volume/assay-out/checkpoint",
-    heartbeat_path="/runpod-volume/assay-out/heartbeat.log",
+    heartbeat_path="/runpod-volume/assay-out/artifacts/heartbeat.log",
+    gpu_mem_util=0.85,
 )
 
 
 def _cfg(**over):
-    return Config(**{**_BASE, **over})
+    return RunConfig(**{**_BASE, **over})
 
 
 def test_keeps_configured_paths_when_weights_present():
@@ -35,9 +34,13 @@ def test_rebases_all_volume_paths_to_workspace():
     # weights are under /workspace, not the configured /runpod-volume
     out = resolve_mount(cfg, exists=lambda p: p == "/workspace/qwen2.5-7b-instruct")
     assert out.weights_path == "/workspace/qwen2.5-7b-instruct"
-    assert out.artifacts_dir == "/workspace/assay-out"
+    assert out.artifacts_dir == "/workspace/assay-out/artifacts"
     assert out.output_dir == "/workspace/assay-out/checkpoint"
-    assert out.heartbeat_path == "/workspace/assay-out/heartbeat.log"
+    assert out.heartbeat_path == "/workspace/assay-out/artifacts/heartbeat.log"
+    # recipe/checkpoint_repo/gpu_mem_util are not paths - they pass through.
+    assert out.recipe is cfg.recipe
+    assert out.checkpoint_repo == cfg.checkpoint_repo
+    assert out.gpu_mem_util == cfg.gpu_mem_util
 
 
 def test_raises_when_weights_absent_everywhere():

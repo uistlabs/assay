@@ -4,13 +4,18 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-# secrets -- never commit
+# secrets - never commit
 *.env
 .env*
 secrets/
-# heavy artifacts -- never commit checkpoints
+# heavy artifacts - never commit checkpoints
 checkpoints/
 *.safetensors
 
-# ephemeral operator scratch (pod ids, launch retries) -- never commit
+# ephemeral operator scratch (pod ids, launch retries) - never commit
 scratchpad*
+
+# local review/orchestration harnesses (e.g. .review-*.mjs adversarial-review scripts)
+# - internal tooling, never commit, never ship in the public snapshot
+.review-*
+*.mjs

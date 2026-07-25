@@ -23,7 +23,7 @@ def test_payload_pins_allowed_cuda_versions():
     # Scheduler-level guarantee: only place us on hosts whose driver supports our cu129
     # stack. FLOOR IS 12.9: 12.8/r570 hosts fail at eval-engine start
     # with cudaErrorUnsupportedPtxVersion because vLLM's FA2 sm_120 kernel ships PTX the
-    # r570 driver's JIT is too old to load. 12.8 MUST be excluded -- it's a guaranteed
+    # r570 driver's JIT is too old to load. 12.8 MUST be excluded - it's a guaranteed
     # failure, not a wider pool. See runpod_ctl.ALLOWED_CUDA_VERSIONS for the full RCA.
     p = build_pod_payload(image="img", volume_id="v", env_keys=["HF_TOKEN"], env={"HF_TOKEN": "t"})
     assert p["allowedCudaVersions"] == ALLOWED_CUDA_VERSIONS
@@ -121,3 +121,47 @@ def test_self_terminate_targets_own_pod_id():
 def test_self_terminate_missing_id_raises():
     with pytest.raises(ValueError, match="RUNPOD_POD_ID"):
         self_terminate({"RUNPOD_API_KEY": "k"}, api=object())
+
+
+def test_self_terminate_retries_transient_failure_then_succeeds():
+    # The sole billing-stopping call must survive a transient API blip: fail twice,
+    # succeed on the third attempt. Without the retry a single 5xx leaves the pod
+    # billing until it restarts and re-runs the whole job.
+    attempts = {"n": 0}
+    sleeps = []
+
+    class FlakyApi:
+        def terminate_pod(self, pod_id):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise RuntimeError("transient 502 from RunPod")
+
+    self_terminate({"RUNPOD_POD_ID": "pod-abc", "RUNPOD_API_KEY": "k"},
+                   api=FlakyApi(), backoff_s=0.0, sleep=sleeps.append)
+    assert attempts["n"] == 3
+    assert len(sleeps) == 2  # slept between the two failures, not after success
+
+
+def test_self_terminate_raises_after_exhausting_attempts():
+    # Persistent failure across all attempts must re-raise (pod_entry.sh's `|| echo`
+    # logs it) rather than silently returning as if the pod were terminated.
+    calls = {"n": 0}
+
+    class DeadApi:
+        def terminate_pod(self, pod_id):
+            calls["n"] += 1
+            raise RuntimeError("RunPod API down")
+
+    with pytest.raises(RuntimeError, match="RunPod API down"):
+        self_terminate({"RUNPOD_POD_ID": "pod-abc", "RUNPOD_API_KEY": "k"},
+                       api=DeadApi(), attempts=3, backoff_s=0.0, sleep=lambda *_: None)
+    assert calls["n"] == 3
+
+
+def test_self_terminate_rejects_nonpositive_attempts():
+    # attempts<=0 skips the retry loop entirely, leaving last_exc=None; the tail
+    # `raise last_exc` would then `raise None` -> TypeError, masking the real signal.
+    # Fail fast with a clear error instead.
+    with pytest.raises(ValueError, match="attempts"):
+        self_terminate({"RUNPOD_POD_ID": "pod-abc", "RUNPOD_API_KEY": "k"},
+                       api=object(), attempts=0)

@@ -18,12 +18,47 @@ set -euo pipefail
 : "${ASSAY_IMAGE:?export ASSAY_IMAGE (ghcr.io/uistlabs/assay:TAG, PUBLIC image)}"
 : "${ASSAY_CHECKPOINT_REPO:?export ASSAY_CHECKPOINT_REPO (your target HF repo id, e.g. yourorg/Model-NVFP4A16)}"
 
+# Digest-pin guard: a mutable tag can be served stale from RunPod's image cache - the
+# exact miss that burned a run. Require a content-addressed digest.
+case "$ASSAY_IMAGE" in
+  *@sha256:*) : ;;  # digest-pinned, good
+  *)
+    echo "FATAL: ASSAY_IMAGE must be digest-pinned (ghcr.io/uistlabs/assay@sha256:...)." >&2
+    echo "A mutable tag can be served stale from RunPod's image cache. Get the digest" >&2
+    echo "from the push output, or:" >&2
+    echo "  podman inspect --format '{{.Digest}}' ghcr.io/uistlabs/assay:<tag>" >&2
+    exit 1
+    ;;
+esac
+
+# Tests-only var guard: ASSAY_JOB_CMD exists ONLY so the loud-failure assert in
+# pod_entry.sh can be exercised by tests with a fake job. A leftover in a real launch
+# env would run something other than the real job - reject it up front.
+for _v in ASSAY_JOB_CMD; do
+  if [ -n "${!_v:-}" ]; then
+    echo "FATAL: $_v is set in the launch environment. It is a TESTS-ONLY override" >&2
+    echo "(fake job-command override) - must never reach a paid pod." >&2
+    echo "Unset it before launching:  unset $_v" >&2
+    exit 1
+  fi
+done
+
+# No-fetch base-card reminder (built from the selected recipe; no network, no secrets).
+python -c '
+import os
+from assay.recipes import get_recipe
+from assay.config import _apply_recipe_overrides
+from assay.preflight import launch_reminder
+r = _apply_recipe_overrides(get_recipe(os.environ.get("ASSAY_RECIPE", "qwen2_5_7b_instruct")), os.environ)
+print(launch_reminder(r))
+' >&2
+
 DRY=""
 [ "${1:-}" = "--dry-run" ] && DRY="1"
 
 # Build the payload via the tested pure function; redact secret values for display.
 # extra_env (I3): any ASSAY_* var in the operator's shell rides along as
-# non-secret pod config -- e.g. ASSAY_NUM_CALIB=8 for a cheap smoke run --
+# non-secret pod config - e.g. ASSAY_NUM_CALIB=8 for a cheap smoke run -
 # without needing an image rebuild. These are config, not secrets, so they are
 # shown unredacted in the dry-run output; only the two real secrets get "***".
 PAYLOAD="$(python -c '

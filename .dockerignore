@@ -1,12 +1,25 @@
-# Keep the build context small: pip install -e . needs only pyproject.toml + src/.
-# Exclude the heavy/irrelevant so `COPY . /app` doesn't drag GBs of venv/git in.
-.venv/
-.git/
-__pycache__/
-*.pyc
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-checkpoints/
-*.safetensors
-docs/
+# ALLOWLIST by default: `COPY . /app` builds a PUBLIC image, so exclude EVERYTHING
+# and re-include only what the build needs. A denylist ships any new local file the
+# operator forgets to list (a stray .env, a scratch script, a review harness); an
+# allowlist ships nothing unless it is named here. Verify after a build with
+#   podman run --rm <img> ls -la /app
+# that only the entries below are present.
+*
+
+# What the image actually needs:
+#   pyproject.toml            - pip install -e . (also reads README.md + LICENSE)
+#   src/                      - the assay package (incl. lm_eval_tasks/*.yaml package data)
+#   scripts/pod_entry.sh      - chmod'd + ENTRYPOINT
+!pyproject.toml
+!README.md
+!LICENSE
+!src/
+!scripts/
+
+# Re-exclude junk that lives INSIDE the re-included dirs (later rules win).
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/*.safetensors
