@@ -1,6 +1,6 @@
 def test_version_is_0_5_0():
     import assay
-    assert assay.__version__ == "0.5.1"
+    assert assay.__version__ == "0.6.1"
 
 
 def test_quantize_imports_and_recipe_constructs():
@@ -38,7 +38,7 @@ def test_module_entrypoint_invokes_main():
         "ASSAY_OUTPUT_DIR": "/tmp/assay-entrypoint-test",
         # required since B7 - must be set so load_config reaches the I2
         # guard this test asserts, instead of raising on the missing key first.
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     }
     proc = subprocess.run(
         [sys.executable, "-m", "assay.job"],

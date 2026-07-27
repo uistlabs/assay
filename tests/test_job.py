@@ -17,7 +17,7 @@ def _make_runcfg():
     """Minimal RunConfig from default recipe + dummy paths for testing."""
     return load_config({
         "ASSAY_HEARTBEAT": "/tmp/heartbeat.log",
-        "ASSAY_CHECKPOINT_REPO": "test/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "test/Model-NVFP4A16",
         "ASSAY_ARTIFACTS_DIR": "/tmp/artifacts",
         "ASSAY_OUTPUT_DIR": "/tmp/output",
         "ASSAY_WEIGHTS_PATH": "/tmp/weights",
@@ -41,7 +41,7 @@ def _mk_deps(calls):
     return Deps(
         quantize=lambda recipe, mp, out, hb: calls.append("quantize") or out,
         run_eval=lambda mp, tasks, hb, gmu, **kw: calls.append(f"eval:{mp}:{gmu}") or {},
-        parse=lambda raw, acc, ppl: {},
+        parse=lambda raw, acc, ppl, **kw: {},
         gate=lambda base, quant, acc, ppl, thr: calls.append("gate") or _passing_gate(),
         publish=lambda runcfg, out, res, hb: calls.append("publish") or True,
     )
@@ -56,7 +56,7 @@ def test_happy_path_runs_all_stages_in_order(tmp_path):
     # module's tests use tmp_path for Heartbeat.
     cfg = load_config({
         "ASSAY_HEARTBEAT": str(tmp_path / "heartbeat.log"),
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     calls = []
     run_job(cfg, {}, _mk_deps(calls))
@@ -72,7 +72,7 @@ def test_run_eval_receives_configured_gpu_mem_util(tmp_path):
     cfg = load_config({
         "ASSAY_HEARTBEAT": str(tmp_path / "heartbeat.log"),
         "ASSAY_GPU_MEM_UTIL": "0.70",
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     calls = []
     run_job(cfg, {}, _mk_deps(calls))
@@ -89,7 +89,7 @@ def test_run_eval_receives_recipe_derived_chat_kwargs_identically(tmp_path):
     from assay.evaluate import assay_task_dir
     cfg = load_config({
         "ASSAY_HEARTBEAT": str(tmp_path / "heartbeat.log"),
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     seen = []
 
@@ -108,6 +108,9 @@ def test_run_eval_receives_recipe_derived_chat_kwargs_identically(tmp_path):
     assert _science(seen[0]) == {
         "apply_chat_template": True,
         "fewshot_as_multiturn": True,
+        # Point-gated recipe (DEFAULT_GATE, no k_stderr): no per-item capture, so
+        # log_samples stays off and no new failure surface appears (D7/F-025).
+        "capture_per_item": False,
         "gen_kwargs": None,
         "system_instruction": None,
         "include_path": assay_task_dir(),
@@ -129,7 +132,7 @@ def test_smoke_scales_pipeline_on_both_eval_calls(tmp_path):
     # baseline and quantized.
     cfg = load_config({
         "ASSAY_HEARTBEAT": str(tmp_path / "heartbeat.log"),
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
         "ASSAY_TIER": "smoke",
     })
     assert cfg.tier == "smoke"
@@ -182,7 +185,7 @@ def _make_runcfg_writable(tmp_path):
         "ASSAY_HEARTBEAT": str(tmp_path / "heartbeat.log"),
         "ASSAY_ARTIFACTS_DIR": str(tmp_path / "art"),
         "ASSAY_OUTPUT_DIR": str(tmp_path / "checkpoint"),
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
 
 
@@ -203,7 +206,7 @@ def test_default_deps_threads_dry_run_from_tier(tmp_path, monkeypatch):
     for tier in ("smoke", "cert"):
         cfg = load_config({
             "ASSAY_HEARTBEAT": str(tmp_path / "hb.log"),
-            "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+            "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
             "ASSAY_TIER": tier,
         })
         # HF_TOKEN must be present: the publish lambda resolves it via require_secret.
@@ -247,7 +250,7 @@ def test_run_job_writes_durable_traceback_on_failure(tmp_path):
         "ASSAY_ARTIFACTS_DIR": str(art),
         "ASSAY_OUTPUT_DIR": str(tmp_path / "checkpoint"),  # sibling, not nested under art
         "ASSAY_HEARTBEAT": str(art / "heartbeat.log"),
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     calls = []
     deps = _mk_deps(calls)._replace(
@@ -267,7 +270,7 @@ def test_run_job_does_not_self_terminate(tmp_path):
         "ASSAY_ARTIFACTS_DIR": str(art),
         "ASSAY_OUTPUT_DIR": str(tmp_path / "checkpoint"),  # sibling, not nested under art
         "ASSAY_HEARTBEAT": str(art / "heartbeat.log"),
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     calls = []
     run_job(cfg, {}, _mk_deps(calls))
@@ -290,7 +293,7 @@ def _run_job_with_real_parse_and_gate(tmp_path, *, gate_passes: bool):
         "ASSAY_ARTIFACTS_DIR": str(artifacts_dir),
         "ASSAY_OUTPUT_DIR": str(output_dir),
         "ASSAY_HEARTBEAT": str(artifacts_dir / "heartbeat.log"),
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     # Trim the recipe's eval battery to gsm8k only: the raw dicts below carry
     # just gsm8k + wikitext, and the task list is recipe-owned now (the old
@@ -373,7 +376,7 @@ def test_run_eval_receives_distinct_persist_paths_and_watchdog_factory(tmp_path)
         "ASSAY_HEARTBEAT": str(tmp_path / "hb.log"),
         "ASSAY_ARTIFACTS_DIR": str(tmp_path / "art"),
         "ASSAY_OUTPUT_DIR": str(tmp_path / "out"),
-        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     seen = []
     run_job(cfg, {"ASSAY_RAW_LOG": "/tmp/raw.log"},
@@ -386,3 +389,36 @@ def test_run_eval_receives_distinct_persist_paths_and_watchdog_factory(tmp_path)
     # NOTE: run_job does NOT pass raw_log_path to run_eval - the _wd_factory closure
     # already closes over raw_log (from env["ASSAY_RAW_LOG"]) via build_eval_watchdog,
     # so run_eval has no raw_log_path param (dropped in the Task 3 review).
+
+
+def test_run_job_keys_pairing_off_k_stderr(tmp_path):
+    """D7/F-025: per-item capture and collection run EXACTLY when the recipe's gate
+    consults an SE. The R1 recipe (k_stderr) gets capture_per_item/collect_items
+    True; the Qwen point gate gets False - so Qwen cert runs gain no new hard-fail
+    surface (and no log_samples payload) for a test their gate never runs."""
+    seen = {}
+
+    def _deps():
+        return Deps(
+            quantize=lambda recipe, mp, out, hb: out,
+            run_eval=lambda mp, tasks, hb, gmu, **kw:
+                seen.setdefault("eval", []).append(kw.get("capture_per_item")) or {},
+            parse=lambda raw, acc, ppl, **kw:
+                seen.setdefault("parse", []).append(kw.get("collect_items")) or {},
+            gate=lambda base, quant, acc, ppl, thr: _passing_gate(),
+            publish=lambda runcfg, out, res, hb: True,
+        )
+
+    for recipe, expected in (("r1_distill_qwen_7b", True), ("qwen2_5_7b_instruct", False)):
+        seen.clear()
+        cfg = load_config({
+            "ASSAY_RECIPE": recipe,
+            "ASSAY_HEARTBEAT": str(tmp_path / "hb.log"),
+            "ASSAY_WEIGHTS_PATH": "/tmp/weights",
+            "ASSAY_CHECKPOINT_REPO": "test/Model-NVFP4A16",
+            "ASSAY_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+            "ASSAY_OUTPUT_DIR": str(tmp_path / "output"),
+        })
+        run_job(cfg, {}, _deps())
+        assert seen["eval"] == [expected, expected], recipe   # both eval sides
+        assert seen["parse"] == [expected, expected], recipe  # both parse calls

@@ -137,6 +137,11 @@ def run_job(runcfg: RunConfig, env, deps: Deps) -> GateResult:
     # Baseline and quantized MUST be evaluated under identical chat-mode/sampling
     # settings - eval_kwargs is built once and passed to both run_eval calls
     # below so a gate delta reflects the quantization, not a settings drift.
+    # Pairing keys off the GATE, not the tier (D7/F-025): per-item capture and
+    # collection run exactly when the recipe's gate consults an SE. A point-gated
+    # recipe (Qwen) keeps log_samples=False and gains no new hard-fail surface for
+    # a significance test its gate never runs.
+    significance = recipe.gate_or_default.k_stderr is not None
     eval_kwargs = dict(
         apply_chat_template=(ev.mode == "chat"),
         fewshot_as_multiturn=(ev.mode == "chat"),
@@ -144,6 +149,7 @@ def run_job(runcfg: RunConfig, env, deps: Deps) -> GateResult:
         system_instruction=ev.system_prompt,
         include_path=assay_task_dir(),
         repeats=ev.repeats,
+        capture_per_item=significance,
     )
     # Tier-driven eval-weakening (TIER_PROFILES, single source): cert leaves the
     # certified methodology untouched (every profile field None); dev/smoke cap
@@ -197,8 +203,10 @@ def run_job(runcfg: RunConfig, env, deps: Deps) -> GateResult:
             os.path.join(runcfg.artifacts_dir, "eval-nvfp4.json"),
             lambda: json.dumps(quant_raw, default=str), hb,
         )
-        base = deps.parse(base_raw, ev.accuracy_tasks, ev.perplexity)
-        quant = deps.parse(quant_raw, ev.accuracy_tasks, ev.perplexity)
+        base = deps.parse(base_raw, ev.accuracy_tasks, ev.perplexity,
+                          collect_items=significance)
+        quant = deps.parse(quant_raw, ev.accuracy_tasks, ev.perplexity,
+                           collect_items=significance)
 
         gate_fn = deps.gate or (lambda b, q, a, p, t: evaluate_gate(b, q, a, p, t))
         result = gate_fn(base, quant, recipe.accuracy_task_names,
@@ -270,7 +278,7 @@ def assert_gpu_available() -> None:
 
 def main() -> None:  # pragma: no cover - pod entrypoint
     from assay.config import load_config, resolve_mount
-    from assay import smoke
+    from assay import smoke, verify
     # Cheap, torch-free config validation FIRST (microseconds, catches a misconfig
     # before importing torch), THEN fail loud on a dead GPU - both in the first
     # second, before any quantize/eval/network work. Never silently CPU-grind
@@ -280,7 +288,13 @@ def main() -> None:  # pragma: no cover - pod entrypoint
     # In-pod tier-1: catches a stale/wrong/mis-built image in the first seconds (CPU,
     # ~2s) - the runtime complement to the launch-side digest pin.
     smoke.tier1_structural()
+    # Weights identity (F-015), deliberately HERE and not in run_job - run_job's
+    # contract is control-flow only and its tests inject fake paths. Cheap small-file
+    # pass before the GPU preflight; the minutes-long shard pass (pristine runs only)
+    # after it, so a dead GPU fails first.
+    verify.verify_weights_small(cfg, os.environ)
     assert_gpu_available()
+    verify.verify_weights_shards(cfg, os.environ)
     deps = default_deps(os.environ)
     result = run_job(cfg, os.environ, deps)
     print(GATE_PASSED_MARKER if result.passed else GATE_FAILED_MARKER)

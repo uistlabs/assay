@@ -134,9 +134,9 @@ uv run pytest                 # fast, GPU-free unit suite - proves the logic
 export RUNPOD_API_KEY=...      # dedicated, pod-scoped, rotatable
 export HF_TOKEN=...            # fine-grained, write-scoped to the target repo
 export ASSAY_VOLUME_ID=...     # your pre-staged weights volume id
-export ASSAY_IMAGE=ghcr.io/<you>/assay:0.5.1   # your PUBLIC image
+export ASSAY_IMAGE=ghcr.io/<you>/assay:0.6.0   # your PUBLIC image
 export ASSAY_CHECKPOINT_REPO=yourorg/Qwen2.5-7B-Instruct-NVFP4A16
-export ASSAY_PIPELINE_URL=https://github.com/uistlabs/assay/tree/v0.5.1  # tag-pinned
+export ASSAY_PIPELINE_URL=https://github.com/uistlabs/assay/tree/v0.6.0  # tag-pinned
 uv run scripts/launch.sh --dry-run   # inspect the pod payload (secrets redacted)
 uv run scripts/launch.sh             # real run
 ```

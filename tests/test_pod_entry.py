@@ -216,3 +216,220 @@ def test_teardown_uploads_then_terminates_on_fail(tmp_path):
     _p, order = _run_with_stub_python("sh -c 'echo GATE FAILED; exit 0'", tmp_path)
     # GATE FAILED is a valid completed run (rc 0, marker present); teardown still fires.
     assert order == ["publish", "terminate"], order
+
+
+def _run_with_cost_stub(job_cmd, tmp_path, cost_exit=0, pod_id="pod-cost"):
+    """Shadow python3.12 with a stub that records call ORDER and lets us force the
+    cost calls to fail. Proves cost runs before the upload, and that a hard cost
+    failure changes nothing about the run's outcome."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    order = tmp_path / "order.log"
+    stub = bindir / "python3.12"
+    stub.write_text(f"""#!/usr/bin/env bash
+if [ "$1" = "-m" ] && [ "$2" = "assay.log_tee" ]; then exec cat > "$3"; fi
+if [ "$1" = "-m" ] && [ "$2" = "assay.cost" ]; then echo "cost-$3" >> {order}; exit {cost_exit}; fi
+if [ "$1" = "-m" ] && [ "$2" = "assay.publish_artifacts" ]; then echo publish >> {order}; exit 0; fi
+if [ "$1" = "-c" ]; then echo terminate >> {order}; exit 0; fi
+exit 0
+""")
+    stub.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "ASSAY_JOB_CMD": job_cmd,
+        "ASSAY_ARTIFACTS_DIR": str(tmp_path / "art"),
+        "RUNPOD_POD_ID": pod_id,
+        "RUNPOD_API_KEY": "dummy",
+    }
+    env.pop("HF_TOKEN", None)
+    p = subprocess.run(["bash", str(POD_ENTRY)], capture_output=True, text=True,
+                       env=env, timeout=60)
+    return p, (order.read_text().split() if order.exists() else [])
+
+
+def test_cost_begins_before_the_job_and_finalizes_before_upload(tmp_path):
+    # Ordering is load-bearing: finalize must land BEFORE publish_artifacts so
+    # cost.json rides the existing upload, and before _terminate because a
+    # terminated pod is no longer queryable.
+    p, order = _run_with_cost_stub("echo GATE PASSED", tmp_path)
+    assert p.returncode == 0, p.stderr
+    assert order == ["cost-begin", "cost-finalize", "publish", "terminate"], order
+
+
+def test_cost_failure_does_not_change_a_passing_exit_code(tmp_path):
+    # The critical safety property. Cost is an observer; a hard failure in it must
+    # not change the run's exit code or skip teardown.
+    p, order = _run_with_cost_stub("echo GATE PASSED", tmp_path, cost_exit=9)
+    assert p.returncode == 0, p.stderr
+    assert order == ["cost-begin", "cost-finalize", "publish", "terminate"], order
+
+
+def test_cost_failure_does_not_mask_a_job_failure(tmp_path):
+    # A failing cost call must not swallow or alter the job's real exit code.
+    p, order = _run_with_cost_stub("sh -c 'echo boom >&2; exit 5'", tmp_path,
+                                   cost_exit=9)
+    assert p.returncode == 5, p.stderr
+    assert "publish" in order and "terminate" in order, order
+
+
+def test_cost_finalize_receives_the_job_exit_code(tmp_path):
+    # finalize is passed ${rc:-}; on a normal completion rc is set, so the record
+    # can distinguish gate_fail from infra_fail.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    args_log = tmp_path / "args.log"
+    stub = bindir / "python3.12"
+    stub.write_text(f"""#!/usr/bin/env bash
+if [ "$1" = "-m" ] && [ "$2" = "assay.log_tee" ]; then exec cat > "$3"; fi
+if [ "$1" = "-m" ] && [ "$2" = "assay.cost" ] && [ "$3" = "finalize" ]; then
+  echo "$@" >> {args_log}; exit 0; fi
+exit 0
+""")
+    stub.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "ASSAY_JOB_CMD": "sh -c 'echo GATE FAILED; exit 0'",
+        "ASSAY_ARTIFACTS_DIR": str(tmp_path / "art"),
+        "RUNPOD_POD_ID": "pod-rc",
+        "RUNPOD_API_KEY": "dummy",
+    }
+    env.pop("HF_TOKEN", None)
+    subprocess.run(["bash", str(POD_ENTRY)], capture_output=True, text=True,
+                   env=env, timeout=60)
+    line = args_log.read_text()
+    assert "--rc 0" in line, line
+    assert "--log" in line, line
+
+
+def test_cost_finalize_receives_a_nonzero_job_exit_code(tmp_path):
+    # Sibling to the test above: a job that fails must round-trip its EXACT rc into
+    # finalize, not get clamped to 0 or silently dropped. Without this, a genuine
+    # gate_fail/job crash could get cost-recorded as if it were infra_fail (empty)
+    # or a clean pass (0) - the same distinction the comment on the test above
+    # exists to protect, just on the nonzero side of it.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    args_log = tmp_path / "args.log"
+    stub = bindir / "python3.12"
+    stub.write_text(f"""#!/usr/bin/env bash
+if [ "$1" = "-m" ] && [ "$2" = "assay.log_tee" ]; then exec cat > "$3"; fi
+if [ "$1" = "-m" ] && [ "$2" = "assay.cost" ] && [ "$3" = "finalize" ]; then
+  echo "$@" >> {args_log}; exit 0; fi
+exit 0
+""")
+    stub.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "ASSAY_JOB_CMD": "sh -c 'echo boom >&2; exit 5'",
+        "ASSAY_ARTIFACTS_DIR": str(tmp_path / "art"),
+        "RUNPOD_POD_ID": "pod-rc5",
+        "RUNPOD_API_KEY": "dummy",
+    }
+    env.pop("HF_TOKEN", None)
+    p = subprocess.run(["bash", str(POD_ENTRY)], capture_output=True, text=True,
+                       env=env, timeout=60)
+    assert p.returncode == 5, p.stderr
+    line = args_log.read_text()
+    assert "--rc 5" in line, line
+    assert "--log" in line, line
+
+
+def test_teardown_finalizes_and_terminates_when_rc_is_never_assigned(tmp_path):
+    # WHY THIS TEST EXISTS: teardown() is an EXIT trap under `set -euo pipefail`.
+    # `rc` is only assigned at `rc=${PIPESTATUS[0]}`, AFTER the job pipeline runs.
+    # If the trap fires before that line - a startup failure or a signal, anywhere
+    # between `trap teardown EXIT` and that assignment - a bare `$rc` would abort
+    # the trap under `set -u` partway through, before ever reaching `_terminate()`,
+    # which is the ONE call that stops billing (no wall-clock backstop exists behind
+    # it - see the header comment in pod_entry.sh). `${rc:-}` is the guard that
+    # keeps `_terminate()` reachable in that exact window. Code review confirmed the
+    # guard is statically correct, but nothing exercised the window it protects -
+    # this test does, by actually landing there and checking self_terminate still
+    # ran, not by pre-seeding `rc` (which would prove nothing about the guard).
+    #
+    # MECHANISM: stub `-m assay.cost begin` (the first fallible call made AFTER
+    # `trap teardown EXIT` is armed but BEFORE `eval "$JOB_CMD" | ...` even starts)
+    # sends SIGTERM to pod_entry.sh's own bash process - its grandparent, since this
+    # stub's parent is the `timeout` wrapping the call (timeout execve's the target
+    # directly, no intermediate shell), and timeout's parent is pod_entry.sh itself.
+    # Bash runs EXIT traps on SIGTERM (unlike SIGKILL), so `teardown` fires with
+    # `rc` never having been assigned.
+    #
+    # EMPIRICALLY VERIFIED (not just asserted here, but hand-checked before writing
+    # this test): running pod_entry.sh directly with this exact stub, bash exits
+    # with rc=143 (SIGTERM) at the shell level - subprocess.run instead reports this
+    # as returncode == -15 (Python's convention for signal-terminated children,
+    # negative signal number rather than 128+n). The job command's stdout never
+    # appears anywhere - it truly never runs, confirming the interrupt lands before
+    # `eval`, not after. `--rc` arrives as a genuinely empty argument (verified via
+    # one-arg-per-line capture, not a substring match that an empty value would
+    # vanish inside of), and both `publish` and `terminate` still fire afterward.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    order = tmp_path / "order.log"
+    finalize_args = tmp_path / "finalize_args.log"
+    stub = bindir / "python3.12"
+    stub.write_text(f"""#!/usr/bin/env bash
+if [ "$1" = "-m" ] && [ "$2" = "assay.log_tee" ]; then exec cat > "$3"; fi
+if [ "$1" = "-m" ] && [ "$2" = "assay.cost" ] && [ "$3" = "begin" ]; then
+  # $PPID is `timeout`'s pid (it execve's us directly); ITS parent is pod_entry.sh's
+  # own bash process - kill that one so the top-level script dies mid-startup,
+  # before it can ever reach `rc=${{PIPESTATUS[0]}}`.
+  entry_pid=$(awk '{{print $4}}' "/proc/$PPID/stat" 2>/dev/null)
+  [ -n "$entry_pid" ] && kill -TERM "$entry_pid"
+  exit 0
+fi
+if [ "$1" = "-m" ] && [ "$2" = "assay.cost" ] && [ "$3" = "finalize" ]; then
+  printf '%s\\n' "$@" >> {finalize_args}
+  exit 0
+fi
+if [ "$1" = "-m" ] && [ "$2" = "assay.publish_artifacts" ]; then echo publish >> {order}; exit 0; fi
+if [ "$1" = "-c" ]; then echo terminate >> {order}; exit 0; fi
+exit 0
+""")
+    stub.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        # A distinctive tripwire, not the default job: if the SIGTERM mechanism
+        # ever failed to interrupt the script before `eval`, this marker would show
+        # up in stdout instead of the test failing silently.
+        "ASSAY_JOB_CMD": "echo MECHANISM_FAILED_JOB_RAN",
+        "ASSAY_ARTIFACTS_DIR": str(tmp_path / "art"),
+        "ASSAY_TERMINATE_ATTEMPTS": "1",
+        "ASSAY_TERMINATE_BACKOFF": "0",
+        "RUNPOD_POD_ID": "pod-rc-unset",
+        "RUNPOD_API_KEY": "dummy",
+    }
+    env.pop("HF_TOKEN", None)
+    p = subprocess.run(["bash", str(POD_ENTRY)], capture_output=True, text=True,
+                       env=env, timeout=60)
+
+    # Died to the signal (not a normal `exit "$rc"` return) - proof the trap path
+    # ran, not the script's ordinary tail.
+    assert p.returncode == -15, (
+        f"expected the process to die to SIGTERM (-15); got {p.returncode}\n"
+        f"stdout={p.stdout!r}\nstderr={p.stderr!r}")
+    assert "MECHANISM_FAILED_JOB_RAN" not in p.stdout + p.stderr, (
+        "the job command ran - the SIGTERM never interrupted the script before "
+        "eval, so this test did not exercise the rc-unset path at all")
+
+    # (1) finalize was still called, and rc was genuinely EMPTY - not "0", not
+    # dropped: one argument, and that argument is the empty string, because
+    # ${rc:-} substituted for a variable that was never assigned.
+    assert finalize_args.exists(), "cost finalize never ran - teardown did not fire"
+    argv = finalize_args.read_text().splitlines()
+    assert "--rc" in argv, argv
+    assert argv[argv.index("--rc") + 1] == "", (
+        f"expected an EMPTY --rc value (rc never assigned); argv={argv}")
+
+    # (2) self_terminate still ran - the property that actually matters here.
+    order_lines = order.read_text().split() if order.exists() else []
+    assert "terminate" in order_lines, (
+        f"self_terminate did not run when rc was unset; order={order_lines}")
+    # (3) and it ran AFTER finalize + publish, i.e. teardown executed its full,
+    # correctly-ordered body rather than something shortcutting straight to it.
+    assert order_lines == ["publish", "terminate"], order_lines

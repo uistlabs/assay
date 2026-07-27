@@ -78,6 +78,15 @@ teardown() {
     # case, no overflow ever happened) must never fail or slow teardown. Bounded with
     # timeout to prevent a stalled volume from hanging the trap before _terminate.
     timeout -k 5 30 cp "${run_log}.spill" "$ARTIFACTS_DIR/stdout.spill" 2>/dev/null || true
+    # Finalize the cost record BEFORE the upload so it rides the existing transport,
+    # and before _terminate because a TERMINATED pod is no longer queryable (verified:
+    # RunPod returns None for every terminated pod id, so there is no post-hoc
+    # recovery). ${rc:-} is load-bearing: this is an EXIT trap, so if it fires before
+    # rc is assigned the pod died mid-run -> empty -> infra_fail, which is exactly
+    # right. Bounded + non-fatal: a cost failure must never cost a run.
+    timeout -k 5 30 python3.12 -m assay.cost finalize "$ARTIFACTS_DIR" \
+        --rc "${rc:-}" --log "$run_log" \
+        || echo "teardown: cost finalize failed (run unaffected)" >&2
     # Upload forensics BEFORE terminating: after self_terminate the pod is dying and a
     # 300s upload would never finish. The volume copy is the source of truth; a failed
     # or hung HF push must never block or over-spend - hence the timeout + `|| echo`.
@@ -88,6 +97,14 @@ teardown() {
     _terminate
 }
 trap teardown EXIT
+
+# Cost basis capture. costPerHr is FIXED for the life of a pod, so it is read ONCE
+# here rather than sampled; the same call captures uptimeSeconds, which is the billed
+# IMAGE-PULL offset the job never sees (uptime starts at pod creation, and a pull has
+# taken 60-90 min on slow hosts). Placed after the full teardown trap is armed, and
+# bounded + non-fatal so it can never cost a run.
+timeout -k 5 30 python3.12 -m assay.cost begin "$ARTIFACTS_DIR" \
+    || echo "pod_entry: cost basis capture failed (run continues)" >&2
 
 set +e
 # Tee the WHOLE process tree (job + eval subprocess + vLLM EngineCore grandchild)

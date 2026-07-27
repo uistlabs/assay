@@ -281,9 +281,41 @@ def _kill_stalled(pgid: int, *, signaler=os.killpg, killer=os.kill,
             pass
 
 
+def stall_drill_warning(env) -> str | None:
+    """Operator warning when the Phase-B wedge rehearsal cannot possibly fire.
+
+    ASSAY_INJECT_STALL_AFTER blocks the eval child AFTER generation to rehearse the
+    kill chain on a real hang. That only exercises anything if the injected stall
+    outlasts ASSAY_STALL_SECONDS; otherwise the child resumes before the watchdog
+    trips and the drill is INERT while looking like it ran.
+
+    Never raises: this runs on the paid path, so a malformed knob degrades to silence
+    rather than stranding a burn (same posture as the threshold parse below). A
+    disabled watchdog (threshold <= 0) is a deliberate, documented override, so an
+    inert drill there is expected rather than surprising."""
+    raw_inject = str(env.get("ASSAY_INJECT_STALL_AFTER", "")).strip()
+    if not raw_inject:
+        return None
+    try:
+        inject = float(raw_inject)
+        threshold = float(str(env.get("ASSAY_STALL_SECONDS", "1800")).strip() or "1800")
+    except ValueError:
+        return None
+    if inject <= 0 or threshold <= 0 or inject > threshold:
+        return None
+    return (f"assay.watchdog: WARNING - ASSAY_INJECT_STALL_AFTER={inject:g} is not "
+            f"longer than ASSAY_STALL_SECONDS={threshold:g}, so the injected stall "
+            "ends before the watchdog can trip and the kill-chain drill is INERT. "
+            "Raise ASSAY_INJECT_STALL_AFTER above ASSAY_STALL_SECONDS to rehearse "
+            "the kill, or lower ASSAY_STALL_SECONDS.")
+
+
 def build_eval_watchdog(child_pid, raw_log_path, heartbeat, env):  # pragma: no cover
     """Production factory: after os.setpgid(0,0) in the child, its pgid == child_pid.
     ASSAY_STALL_SECONDS (default 1800; 0 == limitless) sets the threshold."""
+    drill = stall_drill_warning(env)
+    if drill:
+        print(drill, file=sys.stderr)
     raw_threshold = env.get("ASSAY_STALL_SECONDS", "1800")
     try:
         threshold = float(raw_threshold)

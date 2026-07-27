@@ -123,18 +123,29 @@ def _inject_stall_if_configured(env=None, sleep=time.sleep) -> None:
         sleep(seconds)
 
 
-def parse_results(raw: dict, accuracy_tasks, perplexity) -> dict:
+def parse_results(raw: dict, accuracy_tasks, perplexity, *,
+                  collect_items: bool = False) -> dict:
     """Normalize lm-eval nested output to task -> {"metric": name, "value": v, "stderr": v|None}.
 
     accuracy_tasks is a tuple of (task, fully-qualified-metric-key) pairs; the
     metric key includes any lm-eval filter suffix (e.g. exact_match,flexible-extract)
-    so multi-filter tasks are unambiguous. perplexity is (task, metric) or None."""
+    so multi-filter tasks are unambiguous. perplexity is (task, metric) or None.
+
+    collect_items=True (significance-gated recipes only, D7) additionally pools the
+    child-captured per-item scores into out[task]["items"] via pairing.collect_items,
+    which runs the reconciliation and count asserts per side. ACCURACY tasks only:
+    perplexity stays unpaired BY DESIGN - it is a deterministic loglikelihood metric
+    under a ratio hard bar, and its aggregation is weighted perplexity, so the
+    mean-pooling identity and item-mean pairing do not apply."""
+    from assay.pairing import collect_items as _collect
     results = raw["results"]
     out: dict[str, dict] = {}
     for task, metric in accuracy_tasks:
         value = _require_finite(_pick(results[task], metric), task, metric)
         out[task] = {"metric": metric, "value": value,
                      "stderr": _pick_stderr(results[task], metric)}
+        if collect_items:
+            out[task]["items"] = _collect(raw, task, metric)
     if perplexity is not None:
         ptask, pmetric = perplexity
         value = _require_finite(_pick(results[ptask], pmetric), ptask, pmetric)
@@ -147,7 +158,8 @@ def _eval_child(conn, model_path: str, tasks: list[str], gpu_mem_util: float,
                 apply_chat_template: bool = False, fewshot_as_multiturn: bool = False,
                 gen_kwargs: dict | None = None, system_instruction: str | None = None,
                 include_path: str | None = None, repeats: dict | None = None,
-                limit: int | None = None, persist_path: str | None = None) -> None:
+                limit: int | None = None, persist_path: str | None = None,
+                capture_per_item: bool = False) -> None:
     """Subprocess body for ONE lm-eval run. Ships ("ok", results) or
     ("err", traceback-string) back over conn. Module-level so the spawn
     context can import it by reference in the child interpreter."""
@@ -185,19 +197,36 @@ def _eval_child(conn, model_path: str, tasks: list[str], gpu_mem_util: float,
             system_instruction=system_instruction,
             task_manager=task_manager,
             limit=limit,
-            # log_samples=False is the PRIME wedge fix: the default True builds the
-            # avg@16 CoT samples into a ~16M-token payload that _sanitize_raw
-            # serializes twice and pushes across the Pipe (the 4h40m post-inference
-            # wedge). The gate reads only scalar metrics, never per-sample text.
+            # log_samples ONLY when the recipe's significance gate needs per-item
+            # scores (BITE 2 paired SE) - it is lm-eval's only per-doc channel. The
+            # WEDGE HISTORY (do not relax this): log_samples=True's full samples
+            # payload (avg@16 CoT text) once serialized twice across the Pipe and
+            # wedged a paid R1 burn for 4h40m. The licence for re-enabling it is the
+            # in-child reduction below: samples are reduced to scalar per-item maps
+            # and DELETED before _sanitize_raw, so only tens of KB ever cross the
+            # Pipe. The reduction ordering is non-negotiable (design D5).
             # NOTE: a `bypass` (metric-only) task REQUIRES log_samples=True and lm-eval
             # raises ValueError (evaluator.py) if one is present - none of our recipes
             # use bypass metrics; a future one that does will fail loud right there.
-            log_samples=False,
+            log_samples=capture_per_item,
         )
         # TEST-ONLY: reproduce the post-inference wedge here (generation done, result
         # in hand, not yet serialized/persisted) so a metal Phase-B run watches the
         # watchdog kill this child. No-op unless ASSAY_INJECT_STALL_AFTER is set.
         _inject_stall_if_configured()
+        if capture_per_item:
+            from assay.pairing import reduce_samples  # noqa: PLC0415 - child-side import
+            # D4: a reduction bug must NEVER crash the child after full paid
+            # generation. Persist the eval WITHOUT per-item data plus an explicit
+            # marker; the gate fails loud later ("paired required, per-item data
+            # missing") rather than silently falling back to the unpaired test.
+            try:
+                raw["assay_per_item"] = reduce_samples(raw)
+            except Exception:
+                raw["assay_per_item_error"] = traceback.format_exc()
+        # Unconditional, BEFORE _sanitize_raw (D5): the raw samples payload never
+        # crosses the Pipe, capture or no capture, reduction success or failure.
+        raw.pop("samples", None)
         clean = _sanitize_raw(raw)
         # Persist the completed result in the CHILD, BEFORE the fragile Pipe send, so
         # a wedge/kill in the serialization tail leaves a recoverable result on disk
@@ -223,6 +252,7 @@ def run_eval(model_path: str, tasks: list[str], hb=None,
              gen_kwargs: dict | None = None, system_instruction: str | None = None,
              include_path: str | None = None, repeats: dict | None = None,
              limit: int | None = None, persist_path: str | None = None,
+             capture_per_item: bool = False,
              watchdog_factory=None, join_timeout: float = 120.0) -> dict:
     """Run lm-evaluation-harness on a local model path; return raw results dict.
 
@@ -253,7 +283,7 @@ def run_eval(model_path: str, tasks: list[str], hb=None,
                        args=(send_conn, model_path, list(tasks), gpu_mem_util,
                              apply_chat_template, fewshot_as_multiturn, gen_kwargs,
                              system_instruction, include_path, repeats, limit,
-                             persist_path))
+                             persist_path, capture_per_item))
     proc.start()
     send_conn.close()  # parent's copy of the write end; the child holds the live one
     watchdog = None
@@ -283,6 +313,21 @@ def run_eval(model_path: str, tasks: list[str], hb=None,
             if hb:
                 hb.emit("evaluate", f"recovered {model_path} from persisted child result")
             return recovered
+    # The headline must name the ACTUAL cause. Metal Phase B proved the generic
+    # "CUDA error or OOM kill" text fires on the watchdog-kill path, where neither
+    # happened - sending a 2 AM operator hunting a crash that does not exist. The
+    # watchdog knows whether it fired, so ask it rather than guessing.
+    if getattr(watchdog, "killed", False):
+        raise RuntimeError(
+            f"eval subprocess for {model_path} was KILLED BY THE STALL WATCHDOG "
+            f"(exitcode={proc.exitcode}): every liveness signal (stdout mtime, GPU "
+            "utilization, process-group CPU) stayed flat longer than "
+            "ASSAY_STALL_SECONDS, so the eval was WEDGED, not crashed. Look above "
+            "for the watchdog's kill line and the faulthandler stack dump it "
+            "triggered via SIGUSR1 - that dump shows where the eval was stuck. If "
+            "this battery legitimately goes quiet for long stretches, raise "
+            "ASSAY_STALL_SECONDS; if it wedged, the dump is the evidence."
+        )
     raise RuntimeError(
         f"eval subprocess for {model_path} died without a result "
         f"(exitcode={proc.exitcode}); check the pod log above for a CUDA error or OOM kill"

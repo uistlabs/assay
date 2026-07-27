@@ -23,3 +23,15 @@ deviation in a comment.
 - **Gate mode.** Choose a point gate (large well-powered MC sets) or the significance
   gate (`k_stderr`, for small high-variance generative sets). The gate must match the
   battery's statistical power.
+- **Identity pins (required).** Pin the exact upstream snapshot the recipe certifies:
+
+  ```
+  uv run python scripts/pin_base_files.py <your-recipe-slug>
+  ```
+
+  and paste the emitted `base_revision`/`base_files` into the recipe. The in-pod
+  verifier (`assay.verify`) checks the staged volume against these pins before any
+  GPU spend - an unpinned recipe hard-fails at pod boot. The pins name a COMMIT, not
+  a branch: upstream repos are mutable, and the certificate must describe the exact
+  weights measured. If the base repo later moves, `--check` reports the drift at
+  launch (warn-only); re-pin only after re-reviewing what changed upstream.

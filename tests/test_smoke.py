@@ -3,7 +3,7 @@ from assay import smoke
 
 
 def test_package_imports():
-    assert assay.__version__ == "0.5.1"
+    assert assay.__version__ == "0.6.1"
 
 
 def test_tier1_structural_passes_on_real_recipes():

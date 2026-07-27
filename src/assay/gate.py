@@ -14,9 +14,13 @@ class TaskDelta:
     quantized: float
     delta: float       # quantized - baseline
     retention: float   # quantized / baseline (guard against zero baseline)
-    base_stderr: float | None = None
+    base_stderr: float | None = None       # per-side, informative only - never bands
     quant_stderr: float | None = None
-    combined_stderr: float | None = None   # sqrt(base_se^2 + quant_se^2)
+    # The SE the significance band uses: sem of the PER-ITEM deltas (BITE 2). Both
+    # sides answer the identical item set, so correlation through item difficulty
+    # cancels out of the delta; the old sqrt(base_se^2+quant_se^2) counted it twice
+    # (F-001), widening the band in the false-PASS direction.
+    combined_stderr: float | None = None
     significant: bool | None = None        # significant regression? None => not evaluated
 
 
@@ -29,29 +33,34 @@ class GateResult:
     mean_retention: float
 
 
-def _delta(task, metric, base, quant, base_se=None, quant_se=None, k_stderr=None) -> TaskDelta:
+def _delta(task, metric, base, quant, base_se=None, quant_se=None, k_stderr=None,
+           paired_se=None) -> TaskDelta:
     retention = quant / base if base else 0.0
     combined_se = None
     significant = None
     if k_stderr is not None:
-        # Backstop (defense in depth): parse_results' _pick_stderr already normalizes a
-        # missing OR non-finite stderr to None, but the gate is the certification
-        # authority and must NEVER PASS on a degenerate stderr even if a future refactor
-        # feeds _delta directly. A None or non-finite (NaN/inf) stderr makes combined_se
-        # non-finite -> every "significant drop" test is False -> silent PASS. Refuse it.
-        if (base_se is None or quant_se is None
-                or not math.isfinite(base_se) or not math.isfinite(quant_se)):
+        # The band's SE comes ONLY from the paired per-item deltas. There is
+        # deliberately no unpaired sqrt-combination fallback (D4): silently swapping
+        # the test would change what the certificate means without saying so, and the
+        # unpaired band is exactly the F-001 false-PASS defect this replaced.
+        if paired_se is None:
             raise ValueError(
-                f"gate: task {task!r} has k_stderr set but its stderr is missing or "
-                f"non-finite (baseline={base_se}, quantized={quant_se}) - cannot run a "
-                "significance check. Either the metric reports no stderr (wrong metric "
-                "for a significance gate, or a degenerate n=1/limit=1 eval) or "
-                "parse_results did not capture it.")
-        combined_se = math.sqrt(base_se ** 2 + quant_se ** 2)
+                f"gate: task {task!r} has k_stderr set but no paired per-item SE was "
+                "computed - significance gating requires per-item paired data on both "
+                "sides; the unpaired significance test was removed (F-001).")
+        # Backstop (defense in depth): the gate is the certification authority and
+        # must NEVER PASS on a degenerate SE. sem of a single delta is NaN (ddof=1),
+        # and every comparison against NaN is False -> silent PASS. Refuse it.
+        if not math.isfinite(paired_se):
+            raise ValueError(
+                f"gate: task {task!r} paired SE is non-finite ({paired_se}) - a "
+                "degenerate eval (n=1 item?) cannot run a significance check; "
+                "refusing to gate.")
+        combined_se = paired_se
         # one-sided: only a real DROP fails. delta<0 is a drop; flag it significant
-        # only when the drop exceeds k combined standard errors.
+        # only when the drop exceeds k paired standard errors.
         # FP-tolerance, same class the point-drop check rounds away: a drop landing
-        # exactly on -k*combined_se can compute as that value +/- ~2e-17 and must not
+        # exactly on -k*paired_se can compute as that value +/- ~2e-17 and must not
         # read as significant. Round the excess to 12 decimals before the sign test
         # (12 decimals crushes the FP noise while staying far below real eval-score
         # resolution, so a genuine regression still fails).
@@ -88,9 +97,23 @@ def evaluate_gate(baseline, quantized, accuracy_tasks, perplexity_task,
             if not math.isfinite(d[perplexity_task]["value"]):
                 non_finite.append(f"{perplexity_task} {side} metric is non-finite ({d[perplexity_task]['value']})")
     k = thresholds.k_stderr
+    paired_se: dict[str, float] = {}
+    if k is not None:
+        # BITE 2 (F-001): the significance band uses sem of the per-item deltas,
+        # computed here in the certification authority. Per-item maps arrive via
+        # parse_results(collect_items=True), which already ran the per-side
+        # reconciliation; paired_stderr adds the cross-side join checks (identical
+        # doc sets and doc_hashes - D8). Missing items fail loud in _delta.
+        from assay.pairing import paired_stderr
+        for t in accuracy_tasks:
+            items_b = baseline[t].get("items")
+            items_q = quantized[t].get("items")
+            if items_b is not None and items_q is not None:
+                paired_se[t] = paired_stderr(items_b, items_q, task=t)
     acc_deltas = tuple(
         _delta(t, baseline[t]["metric"], baseline[t]["value"], quantized[t]["value"],
-               baseline[t].get("stderr"), quantized[t].get("stderr"), k)
+               baseline[t].get("stderr"), quantized[t].get("stderr"), k,
+               paired_se.get(t))
         for t in accuracy_tasks
     )
     mean_retention = sum(d.retention for d in acc_deltas) / len(acc_deltas)
@@ -107,7 +130,7 @@ def evaluate_gate(baseline, quantized, accuracy_tasks, perplexity_task,
             if d.significant:
                 reasons.append(
                     f"{d.task} regressed {(-d.delta * 100.0):.2f} pts "
-                    f"(delta {d.delta:+.4f} beyond -{k}*{d.combined_stderr:.4f} combined stderr)")
+                    f"(delta {d.delta:+.4f} beyond -{k}*{d.combined_stderr:.4f} paired stderr)")
 
     if thresholds.max_single_drop_pts is not None:
         for d in acc_deltas:
@@ -181,7 +204,7 @@ def render_delta_table(result: GateResult, thresholds: GateThresholds | None = N
     else:
         k = thresholds.k_stderr
         lines.append(
-            f"Gate: {verdict} - no task regressed beyond k={k:g} combined stderr"
+            f"Gate: {verdict} - no task regressed beyond k={k:g} paired stderr"
             if result.passed and k is not None else f"Gate: {verdict}")
     if has_stderr:
         lines.append("(* = statistically significant regression at the recipe's k)")

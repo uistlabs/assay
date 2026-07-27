@@ -103,6 +103,18 @@ def main(argv: list[str]) -> int:
     secrets = [os.environ.get("HF_TOKEN", ""), os.environ.get("RUNPOD_API_KEY", "")]
     for p in (raw_path, red_path, spill_path):
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    # The raw sink opens "w" and the redacted sink opens O_TRUNC, but the spill was
+    # opened "a" and nothing else truncated it - so a SAME-POD restart concatenated
+    # the previous run's spill onto this run's, contaminating cross-run forensics
+    # (same family as the confirmed heartbeat append-mode bug). Truncate exactly once
+    # here, before the flusher thread starts, so _spill's appends stay within-run.
+    # Best-effort with the same posture as _spill itself: a failure to truncate must
+    # never stop the tee, because the tee failing wedges the job it is logging.
+    try:
+        with open(spill_path, "w", encoding="ascii", errors="replace"):
+            pass
+    except OSError:
+        pass
     sys.stdin.reconfigure(errors="replace")
 
     q: "queue.Queue" = queue.Queue(maxsize=_QUEUE_MAX)

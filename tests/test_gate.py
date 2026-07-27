@@ -180,7 +180,16 @@ def test_custom_thresholds_are_honored():
     assert any("dropped" in reason for reason in r.reasons)
 
 
-# --- CI-aware significance gate (k_stderr) ---
+# --- CI-aware significance gate (k_stderr) - PAIRED (BITE 2, F-001) ---
+#
+# The unpaired sqrt(base_se^2+quant_se^2) band is GONE: both sides answer the
+# identical item set, so they correlate through item difficulty, and unpaired that
+# covariance is counted twice - band too wide, real regressions PASS. With k_stderr
+# set the gate now REQUIRES per-item data on both sides and bands with
+# sem(per-item deltas). There is deliberately no unpaired fallback (D4): a silent
+# test swap would change what the certificate means without saying so.
+
+from tests._pairing_helpers import paired_items
 
 
 def _se_results(gsm8k, arc, ppl, gsm8k_se, arc_se):
@@ -191,22 +200,38 @@ def _se_results(gsm8k, arc, ppl, gsm8k_se, arc_se):
     }
 
 
+def _sig_results(base_gsm, quant_gsm, gsm_pse, base_arc=0.60, quant_arc=0.60,
+                 arc_pse=0.028, base_ppl=10.0, quant_ppl=10.0, n=4):
+    """Both parsed dicts, with per-item maps whose paired SE is exactly *_pse."""
+    gb, gq = paired_items(base_gsm, quant_gsm, gsm_pse, n=n, prefix="g")
+    ab, aq = paired_items(base_arc, quant_arc, arc_pse, n=n, prefix="a")
+    base = {
+        "gsm8k": {"metric": "exact_match,none", "value": base_gsm, "stderr": 0.02, "items": gb},
+        "arc_challenge": {"metric": "acc,none", "value": base_arc, "stderr": 0.02, "items": ab},
+        "wikitext": {"metric": "word_perplexity", "value": base_ppl, "stderr": None},
+    }
+    quant = {
+        "gsm8k": {"metric": "exact_match,none", "value": quant_gsm, "stderr": 0.02, "items": gq},
+        "arc_challenge": {"metric": "acc,none", "value": quant_arc, "stderr": 0.02, "items": aq},
+        "wikitext": {"metric": "word_perplexity", "value": quant_ppl, "stderr": None},
+    }
+    return base, quant
+
+
 _CI_GATE = GateThresholds(min_mean_retention=None, max_single_drop_pts=None,
                           max_ppl_increase=0.03, k_stderr=2.0)
 
 
 def test_significance_pass_when_drop_within_k_stderr():
-    # combined_se = sqrt(.02^2+.02^2)=.028284; 2*that=.056569; drop .05 < threshold -> not significant
-    base = _se_results(0.80, 0.60, 10.0, 0.02, 0.02)
-    quant = _se_results(0.75, 0.60, 10.0, 0.02, 0.02)
+    # paired SE .028284; 2*that=.056569; drop .05 < threshold -> not significant
+    base, quant = _sig_results(0.80, 0.75, gsm_pse=0.028284)
     r = evaluate_gate(base, quant, ("gsm8k", "arc_challenge"), "wikitext", _CI_GATE)
     assert r.passed is True
     assert all(d.significant is False for d in r.accuracy_deltas)
 
 
 def test_significance_fail_when_drop_exceeds_k_stderr():
-    base = _se_results(0.80, 0.60, 10.0, 0.02, 0.02)
-    quant = _se_results(0.73, 0.60, 10.0, 0.02, 0.02)  # drop .07 > .056569
+    base, quant = _sig_results(0.80, 0.73, gsm_pse=0.028284)  # drop .07 > .056569
     r = evaluate_gate(base, quant, ("gsm8k", "arc_challenge"), "wikitext", _CI_GATE)
     assert r.passed is False
     assert any(d.task == "gsm8k" and d.significant for d in r.accuracy_deltas)
@@ -214,45 +239,84 @@ def test_significance_fail_when_drop_exceeds_k_stderr():
 
 
 def test_significance_boundary_exactly_at_threshold_passes():
-    # delta exactly -k*combined_se; strict '<' means exactly-at is NOT significant
-    import math
-    combined = math.sqrt(0.02**2 + 0.02**2)
-    quant_val = 0.80 - 2.0 * combined
-    base = _se_results(0.80, 0.60, 10.0, 0.02, 0.02)
-    quant = _se_results(quant_val, 0.60, 10.0, 0.02, 0.02)
+    # delta exactly -k*paired_se; strict '<' means exactly-at is NOT significant
+    pse = 0.028284
+    base, quant = _sig_results(0.80, 0.80 - 2.0 * pse, gsm_pse=pse)
     r = evaluate_gate(base, quant, ("gsm8k", "arc_challenge"), "wikitext", _CI_GATE)
     assert r.passed is True
 
 
 def test_significance_gate_ignores_point_drop_and_mean_retention():
-    # a 7-pt drop that a point-gate would fail; here it is insignificant (big stderr) -> pass
-    base = _se_results(0.50, 0.60, 10.0, 0.06, 0.02)
-    quant = _se_results(0.44, 0.60, 10.0, 0.06, 0.02)  # drop .06 < 2*sqrt(.06^2+.06^2)=.1697
+    # a 6-pt drop that a point-gate would fail; insignificant here (wide paired SE)
+    base, quant = _sig_results(0.50, 0.44, gsm_pse=0.0849)  # 2*.0849=.1697 > .06
     r = evaluate_gate(base, quant, ("gsm8k", "arc_challenge"), "wikitext", _CI_GATE)
     assert r.passed is True
 
 
-def test_significance_missing_stderr_raises():
-    base = {"gsm8k": {"metric": "exact_match,none", "value": 0.80, "stderr": None},
+def test_paired_se_decides_not_the_per_side_stderrs():
+    """THE reason BITE 2 exists. Ten items answered identically except two real
+    regressions: per-item deltas [0]*8+[-1]*2, paired SE = 0.1333. The per-side
+    stderrs (0.1667/0.153) would give unpaired combined = 0.2263, and at k=1.2 the
+    drop of 0.2 sits INSIDE the unpaired band (0.2716) - the old gate PASSES a real
+    regression. The paired band (0.16) correctly fails it. Correlation through item
+    difficulty is not noise; unpaired it was counted twice."""
+    base_items = {str(i): {"v": float(i % 2), "h": f"h{i}"} for i in range(10)}
+    quant_vals = [float(i % 2) for i in range(10)]
+    quant_vals[1] = 0.0
+    quant_vals[3] = 0.0
+    quant_items = {str(i): {"v": quant_vals[i], "h": f"h{i}"} for i in range(10)}
+    base = {"gsm8k": {"metric": "exact_match,none", "value": 0.5, "stderr": 0.1667,
+                      "items": base_items},
+            "wikitext": {"metric": "word_perplexity", "value": 10.0, "stderr": None}}
+    quant = {"gsm8k": {"metric": "exact_match,none", "value": 0.3, "stderr": 0.153,
+                       "items": quant_items},
+             "wikitext": {"metric": "word_perplexity", "value": 10.0, "stderr": None}}
+    gate = GateThresholds(min_mean_retention=None, max_single_drop_pts=None,
+                          max_ppl_increase=0.03, k_stderr=1.2)
+    r = evaluate_gate(base, quant, ("gsm8k",), "wikitext", gate)
+    assert r.passed is False
+    d = r.accuracy_deltas[0]
+    assert d.significant is True
+    assert d.combined_stderr == pytest.approx(0.13333333, rel=1e-5)
+
+
+def test_significance_missing_items_raises():
+    # D4: with k_stderr set, per-item data is REQUIRED on both sides. No silent
+    # fallback to the unpaired test - that would change what the certificate means
+    # without saying so.
+    base = {"gsm8k": {"metric": "exact_match,none", "value": 0.80, "stderr": 0.02},
             "wikitext": {"metric": "word_perplexity", "value": 10.0, "stderr": None}}
     quant = {"gsm8k": {"metric": "exact_match,none", "value": 0.79, "stderr": 0.02},
              "wikitext": {"metric": "word_perplexity", "value": 10.1, "stderr": None}}
-    with pytest.raises(ValueError, match="gsm8k"):
+    with pytest.raises(ValueError, match="per-item"):
         evaluate_gate(base, quant, ("gsm8k",), "wikitext", _CI_GATE)
 
 
-@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
-def test_significance_nonfinite_stderr_refuses_to_pass(bad):
-    # A degenerate stderr (NaN from lm-eval's ddof=1 mean_stderr on n=1/limit=1, or inf)
-    # must never silently PASS a real regression: sqrt(nan)=nan and every "significant
-    # drop" comparison is False. The gate must REFUSE, not gate. This is the sole
-    # accuracy criterion in significance mode, so a silent PASS here certifies a broken
-    # quant. base 0.70 -> quant 0.30 is a 40-pt drop that must not slip through.
-    base = {"gsm8k": {"metric": "exact_match,none", "value": 0.70, "stderr": bad},
+def test_significance_nonfinite_paired_se_refuses_to_pass():
+    # A single-item eval makes sem NaN (ddof=1), and every comparison against NaN is
+    # False -> silent PASS. The gate must REFUSE. base 0.70 -> quant 0.30 is a 40-pt
+    # drop that must not slip through on a degenerate SE.
+    gb, gq = paired_items(0.70, 0.30, 0.0, n=1)
+    base = {"gsm8k": {"metric": "exact_match,none", "value": 0.70, "stderr": 0.02, "items": gb},
             "wikitext": {"metric": "word_perplexity", "value": 10.0, "stderr": None}}
-    quant = {"gsm8k": {"metric": "exact_match,none", "value": 0.30, "stderr": bad},
+    quant = {"gsm8k": {"metric": "exact_match,none", "value": 0.30, "stderr": 0.02, "items": gq},
              "wikitext": {"metric": "word_perplexity", "value": 10.1, "stderr": None}}
-    with pytest.raises(ValueError, match="non-finite"):
+    # scipy announces the degenerate sample (SmallSampleWarning) right before sem
+    # returns NaN; the warning is the breadcrumb, the ValueError is the gate refusing.
+    with pytest.warns(Warning, match="too small"), \
+            pytest.raises(ValueError, match="non-finite"):
+        evaluate_gate(base, quant, ("gsm8k",), "wikitext", _CI_GATE)
+
+
+def test_significance_doc_hash_mismatch_refuses():
+    # D8 surfaces through the gate: the two sides must have seen identical docs.
+    gb, gq = paired_items(0.80, 0.79, 0.02)
+    gq["doc0"] = {**gq["doc0"], "h": "DIFFERENT"}
+    base = {"gsm8k": {"metric": "exact_match,none", "value": 0.80, "stderr": 0.02, "items": gb},
+            "wikitext": {"metric": "word_perplexity", "value": 10.0, "stderr": None}}
+    quant = {"gsm8k": {"metric": "exact_match,none", "value": 0.79, "stderr": 0.02, "items": gq},
+             "wikitext": {"metric": "word_perplexity", "value": 10.1, "stderr": None}}
+    with pytest.raises(ValueError, match="doc_hash"):
         evaluate_gate(base, quant, ("gsm8k",), "wikitext", _CI_GATE)
 
 
@@ -267,8 +331,7 @@ def test_pick_stderr_normalizes_nonfinite_to_none():
 
 
 def test_ppl_still_gates_under_ci_recipe():
-    base = _se_results(0.80, 0.60, 10.0, 0.02, 0.02)
-    quant = _se_results(0.80, 0.60, 10.5, 0.02, 0.02)  # +5% ppl > 3%
+    base, quant = _sig_results(0.80, 0.80, gsm_pse=0.028, quant_ppl=10.5)  # +5% ppl > 3%
     r = evaluate_gate(base, quant, ("gsm8k", "arc_challenge"), "wikitext", _CI_GATE)
     assert r.passed is False
     assert any("perplexity" in reason for reason in r.reasons)
@@ -284,8 +347,7 @@ def test_default_gate_still_point_gates_over_stderr_dicts():
 
 
 def test_delta_table_shows_stderr_column_and_marker():
-    base = _se_results(0.80, 0.60, 10.0, 0.02, 0.02)
-    quant = _se_results(0.73, 0.60, 10.0, 0.02, 0.02)
+    base, quant = _sig_results(0.80, 0.73, gsm_pse=0.028284)
     r = evaluate_gate(base, quant, ("gsm8k", "arc_challenge"), "wikitext", _CI_GATE)
     table = render_delta_table(r)
     assert "stderr" in table
@@ -294,8 +356,7 @@ def test_delta_table_shows_stderr_column_and_marker():
 
 def test_significance_never_flags_an_improvement():
     # one-sided contract: quant strictly better than base is never a significant regression
-    base = _se_results(0.70, 0.60, 10.0, 0.01, 0.01)
-    quant = _se_results(0.80, 0.60, 10.0, 0.01, 0.01)  # +10pt, tiny stderr
+    base, quant = _sig_results(0.70, 0.80, gsm_pse=0.01)  # +10pt, tiny paired SE
     r = evaluate_gate(base, quant, ("gsm8k", "arc_challenge"), "wikitext", _CI_GATE)
     assert r.passed is True
     assert all(d.significant is False for d in r.accuracy_deltas)
@@ -325,18 +386,21 @@ SIG_GATE = GateThresholds(min_mean_retention=None, max_single_drop_pts=None,
                           max_ppl_increase=0.03, k_stderr=2.0)
 
 
-def _sig_results(a_base, a_quant, se=0.05):
-    # one accuracy task with stderrs (significance mode) + ppl
+def _render_sig_results(a_base, a_quant, pse=0.0707):
+    # one accuracy task in significance mode (per-item paired data) + ppl
+    ib, iq = paired_items(a_base, a_quant, pse, prefix="r")
     return (
-        {"aime24_avg": {"metric": "exact_match,avg", "value": a_base, "stderr": se},
+        {"aime24_avg": {"metric": "exact_match,avg", "value": a_base, "stderr": 0.05,
+                        "items": ib},
          "wikitext": {"metric": "word_perplexity", "value": 10.0, "stderr": None}},
-        {"aime24_avg": {"metric": "exact_match,avg", "value": a_quant, "stderr": se},
+        {"aime24_avg": {"metric": "exact_match,avg", "value": a_quant, "stderr": 0.05,
+                        "items": iq},
          "wikitext": {"metric": "word_perplexity", "value": 10.1, "stderr": None}},
     )
 
 
 def test_render_significance_hides_mean_headline_shows_verdict():
-    base, quant = _sig_results(0.50, 0.49)  # tiny drop, within 2*combined_se
+    base, quant = _render_sig_results(0.50, 0.49)  # tiny drop, within 2*paired_se
     r = evaluate_gate(base, quant, ("aime24_avg",), "wikitext", SIG_GATE)
     out = render_delta_table(r, SIG_GATE)
     assert "Mean accuracy retention:" not in out       # #2: noise headline suppressed

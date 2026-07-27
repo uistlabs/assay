@@ -286,3 +286,40 @@ def test_kill_stalled_snapshots_descendants_before_group_kill():
 
     assert (42, signal.SIGKILL) in calls
     assert escapee_kills == [(777, signal.SIGKILL)]
+
+
+def test_stall_drill_warning_fires_when_injection_cannot_trip_the_watchdog():
+    """F-019: ASSAY_INJECT_STALL_AFTER is the Phase-B wedge rehearsal. If the injected
+    stall is not LONGER than the watchdog threshold, the watchdog can never fire and
+    the drill is silently inert - the operator believes they tested the kill chain."""
+    msg = watchdog.stall_drill_warning({"ASSAY_INJECT_STALL_AFTER": "60",
+                                        "ASSAY_STALL_SECONDS": "1800"})
+    assert msg is not None
+    assert "ASSAY_INJECT_STALL_AFTER" in msg and "ASSAY_STALL_SECONDS" in msg
+    assert msg.isascii()
+
+
+def test_stall_drill_warning_silent_when_the_drill_can_actually_fire():
+    assert watchdog.stall_drill_warning({"ASSAY_INJECT_STALL_AFTER": "2400",
+                                         "ASSAY_STALL_SECONDS": "1800"}) is None
+
+
+def test_stall_drill_warning_silent_when_no_drill_configured():
+    """Production: the knob is unset, so there is nothing to warn about."""
+    assert watchdog.stall_drill_warning({"ASSAY_STALL_SECONDS": "1800"}) is None
+    assert watchdog.stall_drill_warning({}) is None
+
+
+def test_stall_drill_warning_silent_when_watchdog_disabled():
+    """threshold 0 is the documented limitless override - the watchdog is off on
+    purpose, so an inert drill is not a surprise worth warning about."""
+    assert watchdog.stall_drill_warning({"ASSAY_INJECT_STALL_AFTER": "60",
+                                         "ASSAY_STALL_SECONDS": "0"}) is None
+
+
+def test_stall_drill_warning_tolerates_malformed_values():
+    """A malformed knob must never raise here - this runs on the paid path."""
+    assert watchdog.stall_drill_warning({"ASSAY_INJECT_STALL_AFTER": "soon",
+                                         "ASSAY_STALL_SECONDS": "1800"}) is None
+    assert watchdog.stall_drill_warning({"ASSAY_INJECT_STALL_AFTER": "60",
+                                         "ASSAY_STALL_SECONDS": "never"}) is None

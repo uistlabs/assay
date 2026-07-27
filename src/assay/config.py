@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -58,16 +58,37 @@ TIER_PROFILES: dict[str, "TierProfile"] = {
 }
 
 
-# Env vars whose PRESENCE means the run diverged from the pristine git recipe, so a
-# real (non-dry-run) publish is refused. The recipe-override set is EXACTLY what
-# _apply_recipe_overrides consumes (calib x4, base_model, quant_scheme); plus the eval
-# budget knob and the test-only stall-injection knob. Keep in lockstep with
-# _apply_recipe_overrides - a new override there MUST be added here.
-_NONPRISTINE_VARS = (
-    "ASSAY_CALIB_DATASET", "ASSAY_CALIB_SPLIT", "ASSAY_NUM_CALIB",
-    "ASSAY_MAX_SEQ_LEN", "ASSAY_BASE_MODEL", "ASSAY_QUANT_SCHEME",
-    "ASSAY_LIMIT", "ASSAY_INJECT_STALL_AFTER",
-)
+# EVERY recipe override lives in this ONE table: env var -> (target, field, parse).
+# _apply_recipe_overrides iterates it and _NONPRISTINE_VARS is DERIVED from it, so an
+# override cannot be added to one and forgotten in the other.
+#
+# It used to be two hand-maintained lists whose comment said "keep in lockstep - a new
+# override there MUST be added here". That drift direction was FALSE-PASS: add an
+# override, forget the second list, and an overridden run mints a real certificate
+# (F-026). Same failure family as a hand-maintained build-gate assert list.
+_RECIPE_OVERRIDES: "dict[str, tuple[str, str, Callable[[str], object]]]" = {
+    "ASSAY_CALIB_DATASET": ("calib", "dataset", str),
+    "ASSAY_CALIB_SPLIT": ("calib", "split", str),
+    "ASSAY_NUM_CALIB": ("calib", "num_samples", int),
+    "ASSAY_MAX_SEQ_LEN": ("calib", "max_seq_len", int),
+    "ASSAY_BASE_MODEL": ("recipe", "base_model", str),
+    "ASSAY_QUANT_SCHEME": ("recipe", "quant_scheme", str),
+}
+
+# Overrides consumed OUTSIDE _apply_recipe_overrides, so they cannot be derived from the
+# table: the eval-budget knob (_resolve_eval_limit) and the test-only stall injection
+# (read in evaluate.py). These two are the only remaining hand-maintained entries.
+_NONRECIPE_OVERRIDES = ("ASSAY_LIMIT", "ASSAY_INJECT_STALL_AFTER")
+
+# Vars whose PRESENCE means the run diverged from the pristine git recipe, so a real
+# (non-dry-run) publish is refused.
+_NONPRISTINE_VARS = tuple(_RECIPE_OVERRIDES) + _NONRECIPE_OVERRIDES
+
+
+def recipe_override_keys() -> tuple[str, ...]:
+    """The env vars that override the git recipe. Public so tests can assert the
+    pristine guard covers every one of them without restating the list."""
+    return tuple(_RECIPE_OVERRIDES)
 
 
 def _is_pristine(env: Mapping[str, str], tier: str) -> bool:
@@ -120,6 +141,18 @@ class RunConfig:
     # = 26.65 GiB: 7B bf16 weights (~15.2) + CUDA graphs + KV cache, with
     # ~4.7 GiB device headroom for the parent's CUDA context + OS overhead.
     gpu_mem_util: float
+    # Provenance guard: True only for an unmodified cert-tier run. Drives the single
+    # publish chokepoint (dry_run = not pristine): a weakened/overridden run cannot
+    # mint a real DOI cert.
+    #
+    # DELIBERATELY HAS NO DEFAULT, and sits above the defaulted fields to keep that
+    # possible. True fails OPEN. False fails safe but SILENTLY - a constructor that
+    # bypasses load_config and forgets the field would quietly demote a paid cert burn
+    # to dry-run, visible only in an identity line nobody reads during an incident.
+    # Required turns that into a TypeError at construction, in unit tests, at $0.
+    # Publish-integrity bits are never defaulted (see also publish_if_passed's
+    # keyword-only dry_run).
+    pristine: bool
     # Run tier: "cert" (default, the certified methodology), "dev" (cheap ~30-min
     # validation), or "smoke" (seconds-long plumbing). Selected by ASSAY_TIER; drives
     # eval-weakening (TIER_PROFILES) and, via the guard, publish dry-run.
@@ -127,10 +160,6 @@ class RunConfig:
     # Effective eval limit (docs/task) after tier + ASSAY_LIMIT. None = full battery.
     # Never 1 (refused at load).
     eval_limit: int | None = None
-    # Provenance guard: True only for an unmodified cert-tier run. Drives the single
-    # publish chokepoint (dry_run = not pristine): a weakened/overridden run cannot
-    # mint a real DOI cert.
-    pristine: bool = True
 
 
 def _is_within(child: str, parent: str) -> bool:
@@ -143,21 +172,21 @@ def _is_within(child: str, parent: str) -> bool:
 def _apply_recipe_overrides(recipe: Recipe, env: Mapping[str, str]) -> Recipe:
     """2 AM escape hatch: scalar env vars override recipe fields for a one-off,
     without editing code. Structured science (task lists, mode, sampling) is changed
-    by editing the recipe in git."""
-    calib = recipe.calib
-    if "ASSAY_CALIB_DATASET" in env:
-        calib = replace(calib, dataset=env["ASSAY_CALIB_DATASET"])
-    if "ASSAY_CALIB_SPLIT" in env:
-        calib = replace(calib, split=env["ASSAY_CALIB_SPLIT"])
-    if "ASSAY_NUM_CALIB" in env:
-        calib = replace(calib, num_samples=int(env["ASSAY_NUM_CALIB"]))
-    if "ASSAY_MAX_SEQ_LEN" in env:
-        calib = replace(calib, max_seq_len=int(env["ASSAY_MAX_SEQ_LEN"]))
-    recipe = replace(recipe, calib=calib)
-    if "ASSAY_BASE_MODEL" in env:
-        recipe = replace(recipe, base_model=env["ASSAY_BASE_MODEL"])
-    if "ASSAY_QUANT_SCHEME" in env:
-        recipe = replace(recipe, quant_scheme=env["ASSAY_QUANT_SCHEME"])
+    by editing the recipe in git.
+
+    Driven entirely by _RECIPE_OVERRIDES so the pristine guard derives from the same
+    table (F-026) - there is no second list to keep in step."""
+    calib_changes: dict[str, object] = {}
+    recipe_changes: dict[str, object] = {}
+    for key, (target, field, parse) in _RECIPE_OVERRIDES.items():
+        if key not in env:
+            continue
+        value = parse(env[key])
+        (calib_changes if target == "calib" else recipe_changes)[field] = value
+    if calib_changes:
+        recipe = replace(recipe, calib=replace(recipe.calib, **calib_changes))
+    if recipe_changes:
+        recipe = replace(recipe, **recipe_changes)
     return recipe
 
 
@@ -267,7 +296,7 @@ def load_config(env: Mapping[str, str]) -> RunConfig:
         print("assay.config: ASSAY_PIPELINE_URL unset on a live cert run - the "
               "published model card will name the pipeline with no pipeline link. "
               "Set it to the TAG-PINNED repo URL, e.g. "
-              "https://github.com/uistlabs/assay/tree/v0.5.1 - a card is a frozen "
+              "https://github.com/uistlabs/assay/tree/v0.6.1 - a card is a frozen "
               "certification record, so the link must pin the exact certifying code.",
               file=sys.stderr)
 
@@ -275,7 +304,11 @@ def load_config(env: Mapping[str, str]) -> RunConfig:
         recipe=recipe,
         checkpoint_repo=_require_env(env, "ASSAY_CHECKPOINT_REPO"),
         pipeline_url=pipeline_url,
-        weights_path=env.get("ASSAY_WEIGHTS_PATH", "/runpod-volume/qwen2.5-7b-instruct"),
+        # REQUIRED with no default, same rationale as ASSAY_CHECKPOINT_REPO above: the
+        # old default was a QWEN path for EVERY recipe, so an R1 run that forgot the
+        # var silently pointed at the Qwen volume instead of failing (F-015). Required
+        # turns that into a $0 pre-spend failure on the operator's box.
+        weights_path=_require_env(env, "ASSAY_WEIGHTS_PATH"),
         artifacts_dir=artifacts_dir,
         output_dir=output_dir,
         heartbeat_path=heartbeat_path,
@@ -325,10 +358,13 @@ def resolve_mount(cfg: RunConfig, exists=os.path.exists) -> RunConfig:
                 output_dir=rebase(cfg.output_dir),
                 heartbeat_path=rebase(cfg.heartbeat_path),
             )
+    # Name the recipe's OWN base model, never a hardcoded one: this message used to say
+    # "Qwen weights not found" on every recipe, telling a 2 AM operator on an R1 run that
+    # the wrong model was missing (F-029).
     raise FileNotFoundError(
-        f"Qwen weights not found at {cfg.weights_path!r} nor at the same relative "
-        f"path under any of {_VOLUME_MOUNT_CANDIDATES}; is the weights volume "
-        "attached with the model staged on it?"
+        f"{cfg.recipe.base_model} weights not found at {cfg.weights_path!r} nor at the "
+        f"same relative path under any of {_VOLUME_MOUNT_CANDIDATES}; is the weights "
+        "volume attached with the model staged on it?"
     )
 
 

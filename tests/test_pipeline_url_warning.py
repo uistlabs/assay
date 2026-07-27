@@ -10,7 +10,7 @@ from assay.config import load_config
 
 
 def _env(**kw):
-    return {"ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16", **kw}
+    return {"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16", **kw}
 
 
 def test_warns_when_pipeline_url_unset_on_live_cert_run(capsys):
@@ -24,8 +24,8 @@ def test_warns_when_pipeline_url_unset_on_live_cert_run(capsys):
 
 def test_silent_when_pipeline_url_is_set(capsys):
     cfg = load_config(_env(
-        ASSAY_PIPELINE_URL="https://github.com/uistlabs/assay/tree/v0.5.1"))
-    assert cfg.pipeline_url.endswith("/tree/v0.5.1")
+        ASSAY_PIPELINE_URL="https://github.com/uistlabs/assay/tree/v0.6.0"))
+    assert cfg.pipeline_url.endswith("/tree/v0.6.0")
     assert "ASSAY_PIPELINE_URL" not in capsys.readouterr().err
 
 

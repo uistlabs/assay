@@ -1,6 +1,6 @@
 [project]
 name = "assay"
-version = "0.5.1"
+version = "0.6.1"
 description = "NVFP4 quantization + benchmark-gated publishing pipeline"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,13 +13,21 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "llmcompressor>=0.6.0",
-    "lm-eval>=0.4.5",
+    # Floors track the certified set in deploy/constraints.txt (exact pins + per-pin
+    # rationale live there; the image build-gate asserts them). Floors here keep a
+    # fresh dev env from resolving anything older than what certification runs on -
+    # ">=0.6.0" was satisfied by the tested 0.12 only by luck (F-006).
+    "llmcompressor>=0.12",
+    "lm-eval>=0.4.12",
     "transformers>=4.48",
     "torch>=2.5",
     "datasets>=3.0",
     "huggingface-hub>=0.27",
     "runpod>=1.7",
+    # The gate's statistics library: the certification decision rests on
+    # scipy.stats.sem (paired significance test, BITE 2). Was transitive-only via
+    # lm-eval (F-011) - the thing the verdict rests on is declared, not inherited.
+    "scipy>=1.18",
 ]
 
 [project.urls]

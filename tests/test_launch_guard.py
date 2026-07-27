@@ -12,6 +12,7 @@ def _run(image: str) -> subprocess.CompletedProcess:
         **os.environ,
         "RUNPOD_API_KEY": "dummy", "HF_TOKEN": "dummy",
         "ASSAY_VOLUME_ID": "vol", "ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/runpod-volume/model",  # required since F-015
         "ASSAY_IMAGE": image,
     }
     return subprocess.run(["bash", str(LAUNCH), "--dry-run"],
@@ -43,6 +44,7 @@ def test_rejects_tests_only_vars_at_launch(var, val):
         **os.environ,
         "RUNPOD_API_KEY": "dummy", "HF_TOKEN": "dummy",
         "ASSAY_VOLUME_ID": "vol", "ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/runpod-volume/model",
         "ASSAY_IMAGE": "ghcr.io/uistlabs/assay@sha256:" + "a" * 64,
         var: val,
     }
@@ -50,3 +52,36 @@ def test_rejects_tests_only_vars_at_launch(var, val):
                        capture_output=True, text=True, env=env, timeout=60)
     assert p.returncode != 0
     assert var in p.stderr and "TESTS-ONLY" in p.stderr
+
+
+def test_requires_weights_path_before_spend():
+    """F-015 amendment 3, launch-side half: load_config now REQUIRES
+    ASSAY_WEIGHTS_PATH, so a launch without it would create a pod that dies at
+    boot - paid create + image pull for nothing. The required-vars block must
+    catch it on the operator's box at $0."""
+    env = {
+        **os.environ,
+        "RUNPOD_API_KEY": "dummy", "HF_TOKEN": "dummy",
+        "ASSAY_VOLUME_ID": "vol", "ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16",
+        "ASSAY_IMAGE": "ghcr.io/uistlabs/assay@sha256:" + "a" * 64,
+    }
+    env.pop("ASSAY_WEIGHTS_PATH", None)
+    p = subprocess.run(["bash", str(LAUNCH), "--dry-run"],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert p.returncode != 0
+    assert "ASSAY_WEIGHTS_PATH" in p.stderr
+
+
+def test_pin_drift_check_is_wired_warn_only():
+    """F-015 amendment 4: the launch-side hub cross-check of the recipe's identity
+    pins. Contract-grep (same style as the pod_entry marker test): it must exist,
+    be non-fatal (drift is information; the hard gate is the in-pod verifier), be
+    time-bounded, and stand down when ASSAY_BASE_MODEL deliberately overrides the
+    base model (the pins do not describe the overridden model)."""
+    text = LAUNCH.read_text()
+    assert "pin_base_files.py" in text
+    check_line = next(l for l in text.splitlines() if "pin_base_files.py" in l and "python" in l)
+    assert "--check" in check_line
+    assert "|| true" in check_line or "|| true" in text.split("pin_base_files.py")[1][:200]
+    assert "timeout" in check_line
+    assert "ASSAY_BASE_MODEL" in text

@@ -111,8 +111,20 @@ def _check_recipe(recipe) -> None:
     if status != "ok":
         raise RuntimeError(f"tier-1 spawn round-trip failed for {recipe.slug}:\n{payload}")
 
-    base = parse_results(payload, ev.accuracy_tasks, ev.perplexity)
-    quant = parse_results(payload, ev.accuracy_tasks, ev.perplexity)
+    # Significance recipes (k_stderr) now run the PAIRED path (BITE 2): stub two
+    # per-item docs per accuracy task whose mean equals the stubbed aggregate, so
+    # parse-side pooling + reconciliation and the gate's paired-sem band all execute
+    # against this recipe's real (task, metric) mapping - the same "one path, three
+    # call sites" contract as the rest of tier-1.
+    sig = recipe.gate_or_default.k_stderr is not None
+    if sig:
+        payload["assay_per_item"] = {
+            task: {metric: {"0": {"v": 0.4, "h": "h0"}, "1": {"v": 0.6, "h": "h1"}}}
+            for task, metric in ev.accuracy_tasks}
+        payload["n-samples"] = {task: {"original": 2, "effective": 2}
+                                for task, _ in ev.accuracy_tasks}
+    base = parse_results(payload, ev.accuracy_tasks, ev.perplexity, collect_items=sig)
+    quant = parse_results(payload, ev.accuracy_tasks, ev.perplexity, collect_items=sig)
     result = evaluate_gate(base, quant, recipe.accuracy_task_names,
                            recipe.perplexity_task_name, recipe.gate_or_default)
     render_delta_table(result, recipe.gate_or_default)  # must not raise for this recipe's gate

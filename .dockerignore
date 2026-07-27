@@ -10,11 +10,14 @@
 #   pyproject.toml            - pip install -e . (also reads README.md + LICENSE)
 #   src/                      - the assay package (incl. lm_eval_tasks/*.yaml package data)
 #   scripts/pod_entry.sh      - chmod'd + ENTRYPOINT
+#   deploy/constraints.txt    - the pinned coherent set: read by both pip resolves
+#                               and re-read by the build gate's pin assert (F-006/7/11)
 !pyproject.toml
 !README.md
 !LICENSE
 !src/
 !scripts/
+!deploy/constraints.txt
 
 # Re-exclude junk that lives INSIDE the re-included dirs (later rules win).
 **/__pycache__/

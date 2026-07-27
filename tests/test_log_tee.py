@@ -110,3 +110,46 @@ def test_redacts_across_async_boundary(tmp_path):
     assert "hf_SECRET" not in vol.read_text()
     assert "GATE PASSED" in vol.read_text()
     assert "hf_SECRET" in raw.read_text()  # raw stays unredacted + local
+
+
+def test_spill_is_truncated_per_run(tmp_path):
+    """F-018: raw and redacted sinks are opened truncating, but the spill was opened
+    'a'. On a same-pod restart that concatenates a new run's lines onto the previous
+    run's, contaminating cross-run forensics - the same family as the confirmed
+    heartbeat append-mode bug."""
+    raw = tmp_path / "raw.log"
+    red = tmp_path / "vol.log"
+    spill = tmp_path / "spill.log"
+    spill.write_text("PRIOR RUN LINE\n")
+    proc = subprocess.run(
+        [sys.executable, "-m", "assay.log_tee", str(raw), str(red), str(spill)],
+        input="fresh run line\n", capture_output=True, text=True,
+        env={"HF_TOKEN": "", "RUNPOD_API_KEY": "", "PYTHONPATH": "src"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "PRIOR RUN LINE" not in spill.read_text(), \
+        "previous run's spill survived into this run's forensics"
+
+
+def test_spill_still_captures_overflow_after_truncation(tmp_path):
+    """Truncating must not break the failover itself: with an unwritable volume
+    path, lines must still reach the spill."""
+    raw = tmp_path / "raw.log"
+    red = tmp_path / "nodir" / "vol.log"   # parent created by main(), then made read-only
+    spill = tmp_path / "spill.log"
+    spill.write_text("PRIOR\n")
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import os,sys;"
+         "os.makedirs(sys.argv[2].rsplit('/',1)[0], exist_ok=True);"
+         "os.chmod(sys.argv[2].rsplit('/',1)[0], 0o500);"
+         "sys.argv=['x']+sys.argv[1:];"
+         "from assay.log_tee import main; raise SystemExit(main(sys.argv))",
+         str(raw), str(red), str(spill)],
+        input="line after failure\n", capture_output=True, text=True,
+        env={"HF_TOKEN": "", "RUNPOD_API_KEY": "", "PYTHONPATH": "src"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    content = spill.read_text()
+    assert "PRIOR" not in content
+    assert "line after failure" in content

@@ -16,6 +16,9 @@ _BASE = dict(
     output_dir="/runpod-volume/assay-out/checkpoint",
     heartbeat_path="/runpod-volume/assay-out/artifacts/heartbeat.log",
     gpu_mem_util=0.85,
+    # pristine is required (F-017). An arbitrarily constructed config models
+    # "not publishable" - the safe value for a fixture that asserts nothing about it.
+    pristine=False,
 )
 
 

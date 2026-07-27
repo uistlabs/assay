@@ -21,7 +21,7 @@ from assay.heartbeat import Heartbeat
 def _child_ok(conn, model_path, tasks, gpu_mem_util,
              apply_chat_template=False, fewshot_as_multiturn=False,
              gen_kwargs=None, system_instruction=None,
-             include_path=None, repeats=None, limit=None, persist_path=None):
+             include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
     # Echo the inputs back so the test proves they crossed the process
     # boundary intact (tasks list, knob value), not just that SOMETHING ran.
     conn.send(("ok", {"path": model_path, "tasks": tasks, "gmu": gpu_mem_util}))
@@ -31,7 +31,7 @@ def _child_ok(conn, model_path, tasks, gpu_mem_util,
 def _child_err(conn, model_path, tasks, gpu_mem_util,
                apply_chat_template=False, fewshot_as_multiturn=False,
                gen_kwargs=None, system_instruction=None,
-               include_path=None, repeats=None, limit=None, persist_path=None):
+               include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
     conn.send(("err", "Traceback (most recent call last):\nValueError: boom"))
     conn.close()
     raise SystemExit(1)
@@ -40,7 +40,7 @@ def _child_err(conn, model_path, tasks, gpu_mem_util,
 def _child_dies_silently(conn, model_path, tasks, gpu_mem_util,
                          apply_chat_template=False, fewshot_as_multiturn=False,
                          gen_kwargs=None, system_instruction=None,
-                         include_path=None, repeats=None, limit=None, persist_path=None):
+                         include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
     # Simulate a hard native crash (CUDA abort, OOM kill): no message, no
     # clean close, nonzero exit. os._exit skips interpreter cleanup entirely.
     os._exit(3)
@@ -48,7 +48,7 @@ def _child_dies_silently(conn, model_path, tasks, gpu_mem_util,
 
 def _child_echo_kwargs(conn, model_path, tasks, gpu_mem_util,
                        apply_chat_template, fewshot_as_multiturn, gen_kwargs, system_instruction,
-                       include_path=None, repeats=None, limit=None, persist_path=None):
+                       include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
     conn.send(("ok", {
         "apply_chat_template": apply_chat_template,
         "fewshot_as_multiturn": fewshot_as_multiturn,
@@ -85,7 +85,7 @@ def test_run_eval_raises_on_silent_child_death(monkeypatch):
 def _child_echo_limit(conn, model_path, tasks, gpu_mem_util,
                       apply_chat_template=False, fewshot_as_multiturn=False,
                       gen_kwargs=None, system_instruction=None,
-                      include_path=None, repeats=None, limit=None, persist_path=None):
+                      include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
     conn.send(("ok", {"limit": limit}))
     conn.close()
 
@@ -122,7 +122,7 @@ def test_run_eval_forwards_include_path_and_repeats(monkeypatch):
 
     def fake_child(conn, model_path, tasks, gpu_mem_util, apply_chat_template=False,
                    fewshot_as_multiturn=False, gen_kwargs=None, system_instruction=None,
-                   include_path=None, repeats=None, limit=None, persist_path=None):
+                   include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
         conn.send(("ok", {"include_path": include_path, "repeats": repeats}))
         conn.close()
 
@@ -305,7 +305,7 @@ def test_run_eval_default_gpu_mem_util_matches_config_default():
     from assay.config import load_config
 
     sig = inspect.signature(evaluate.run_eval)
-    cfg = load_config({"ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
+    cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
     assert sig.parameters["gpu_mem_util"].default == cfg.gpu_mem_util
 
 
@@ -352,7 +352,7 @@ def _child_persists_then_dies(conn, model_path, tasks, gpu_mem_util,
                               apply_chat_template=False, fewshot_as_multiturn=False,
                               gen_kwargs=None, system_instruction=None,
                               include_path=None, repeats=None, limit=None,
-                              persist_path=None):
+                              persist_path=None, capture_per_item=False):
     # Completed the eval and PERSISTED, then died before/without a clean send
     # (the wedge-then-kill signature). The parent must recover from persist_path.
     with open(persist_path, "w") as fh:
@@ -411,3 +411,145 @@ def test_run_eval_starts_and_stops_watchdog_with_child_pid(monkeypatch):
     kinds = [e[0] for e in events]
     assert kinds == ["build", "start", "stop"]
     assert events[0][1] > 0  # a real pid was passed
+
+
+class _FakeWatchdog:
+    """Minimal StallWatchdog stand-in: records start/stop and reports whether it
+    fired the kill. `killed` is the real class's public flag (watchdog.py)."""
+
+    def __init__(self, killed):
+        self.killed = killed
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_dead_child_after_watchdog_kill_names_the_watchdog_not_cuda(monkeypatch):
+    """F-016: the dead-child headline must not send a 2 AM operator hunting a CUDA
+    error or an OOM kill when the StallWatchdog is what killed the eval. Metal
+    Phase B proved this exact misattribution on the watchdog-kill path."""
+    monkeypatch.setattr(evaluate, "_eval_child", _child_dies_silently)
+    wd = _FakeWatchdog(killed=True)
+    with pytest.raises(RuntimeError) as excinfo:
+        evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork",
+                          watchdog_factory=lambda pid, hb: wd)
+    msg = str(excinfo.value)
+    assert "watchdog" in msg.lower()
+    assert "stall" in msg.lower()
+    assert "ASSAY_STALL_SECONDS" in msg          # names the knob the operator turns
+    assert "CUDA" not in msg and "OOM" not in msg  # the wrong cause must be absent
+    assert msg.isascii()
+
+
+def test_dead_child_without_watchdog_kill_keeps_cuda_oom_guidance(monkeypatch):
+    """The CUDA/OOM guidance is correct when the watchdog did NOT fire - the fix
+    must narrow the message, not replace one misattribution with another."""
+    monkeypatch.setattr(evaluate, "_eval_child", _child_dies_silently)
+    wd = _FakeWatchdog(killed=False)
+    with pytest.raises(RuntimeError, match=r"CUDA error or OOM kill"):
+        evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork",
+                          watchdog_factory=lambda pid, hb: wd)
+
+
+def test_dead_child_with_no_watchdog_at_all_keeps_cuda_oom_guidance(monkeypatch):
+    """No watchdog wired (unit/dev path): fall back to the original guidance rather
+    than crashing on a missing attribute."""
+    monkeypatch.setattr(evaluate, "_eval_child", _child_dies_silently)
+    with pytest.raises(RuntimeError, match=r"CUDA error or OOM kill"):
+        evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork")
+
+
+# --- BITE 2: per-item capture in the real child (D4/D5) ----------------------
+
+def _stub_lm_eval(monkeypatch, result):
+    import sys
+    import types
+    fake_lm_eval = types.ModuleType("lm_eval")
+    fake_lm_eval.simple_evaluate = lambda **k: result(k) if callable(result) else dict(result)
+    fake_tasks = types.ModuleType("lm_eval.tasks")
+    fake_tasks.TaskManager = object
+    fake_tasks.get_task_dict = lambda *a, **k: {}
+    monkeypatch.setitem(sys.modules, "lm_eval", fake_lm_eval)
+    monkeypatch.setitem(sys.modules, "lm_eval.tasks", fake_tasks)
+
+
+def _samples_raw(_kwargs=None):
+    return {
+        "results": {"gsm8k": {"exact_match,none": 0.5}},
+        "n-samples": {"gsm8k": {"original": 2, "effective": 2}},
+        "samples": {"gsm8k": [
+            {"doc_id": 0, "doc_hash": "h0", "filter": "none",
+             "metrics": ["exact_match"], "exact_match": 1.0, "resps": ["big" * 1000]},
+            {"doc_id": 1, "doc_hash": "h1", "filter": "none",
+             "metrics": ["exact_match"], "exact_match": 0.0, "resps": ["big" * 1000]},
+        ]},
+    }
+
+
+def test_real_eval_child_capture_reduces_and_deletes_samples(monkeypatch):
+    # D5, non-negotiable ordering: the reduced per-item map crosses the Pipe; the
+    # raw samples payload (the object that wedged a paid burn for ~6h) never does.
+    _stub_lm_eval(monkeypatch, _samples_raw)
+    payload = evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork",
+                                capture_per_item=True)
+    assert "samples" not in payload
+    assert payload["assay_per_item"]["gsm8k"]["exact_match,none"] == {
+        "0": {"v": 1.0, "h": "h0"}, "1": {"v": 0.0, "h": "h1"}}
+
+
+def test_real_eval_child_capture_enables_log_samples(monkeypatch):
+    _stub_lm_eval(monkeypatch, lambda k: {"results": {"seen": {"v": k.get("log_samples")}}})
+    payload = evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork",
+                                capture_per_item=True)
+    assert payload["results"]["seen"]["v"] is True
+
+
+def test_real_eval_child_reduction_failure_keeps_eval_and_marks_error(monkeypatch):
+    # D4: a reduction bug must NOT crash the child after full paid generation. The
+    # eval persists WITHOUT per-item data plus an explicit marker; the gate fails
+    # loud later ("paired required, per-item data missing") instead of silently
+    # falling back to the unpaired test.
+    bad = _samples_raw()
+    del bad["samples"]["gsm8k"][0]["metrics"]  # schema drift -> reduce raises
+    _stub_lm_eval(monkeypatch, lambda k: bad)
+    payload = evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork",
+                                capture_per_item=True)
+    assert "samples" not in payload
+    assert "assay_per_item" not in payload
+    assert "metrics" in payload["assay_per_item_error"]
+    assert payload["results"]["gsm8k"]["exact_match,none"] == 0.5  # eval survived
+
+
+def test_real_eval_child_deletes_stray_samples_even_without_capture(monkeypatch):
+    # Defense in depth: if the harness ever returns samples despite
+    # log_samples=False, they must still never cross the Pipe.
+    _stub_lm_eval(monkeypatch, _samples_raw)
+    payload = evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork")
+    assert "samples" not in payload
+    assert "assay_per_item" not in payload
+
+
+def test_parse_results_collects_items_for_accuracy_tasks_only():
+    raw = _samples_raw()
+    from assay.pairing import reduce_samples
+    raw["assay_per_item"] = reduce_samples(raw)
+    del raw["samples"]
+    raw["results"]["wikitext"] = {"word_perplexity,none": 10.0}
+    out = evaluate.parse_results(raw, (("gsm8k", "exact_match,none"),),
+                                 ("wikitext", "word_perplexity"), collect_items=True)
+    assert set(out["gsm8k"]["items"]) == {"gsm8k:0", "gsm8k:1"}
+    # Perplexity stays unpaired BY DESIGN: deterministic loglikelihood metric under
+    # a ratio hard bar, aggregation is weighted perplexity - item-mean pairing
+    # does not apply.
+    assert "items" not in out["wikitext"]
+
+
+def test_parse_results_default_shape_unchanged():
+    raw = _samples_raw()
+    out = evaluate.parse_results(raw, (("gsm8k", "exact_match,none"),), None)
+    assert "items" not in out["gsm8k"]

@@ -1,0 +1,52 @@
+# The pinned coherent set - ONE source of truth (F-006/F-007/F-011).
+#
+# Passed as `pip install -c` to every pip resolve in deploy/Dockerfile, so the
+# whole set is resolved in a single pass. Never force-pin one of these with a
+# later `pip install pkg==X`: that can silently down-force a transitive of
+# something already installed into an incoherent pair while every assert still
+# passes. If a future bump makes this set unsatisfiable, the BUILD fails loudly -
+# which is the point. The build gate re-reads this file and asserts the installed
+# versions match, so adding a pin here automatically extends the gate.
+#
+# This is a 0.x ecosystem: vLLM/llmcompressor/compressed-tensors pin each other
+# with == because "patch" releases can carry format/API changes. Bump as a unit,
+# and bump the dev env (uv) in the same commit - tests/test_build_pins.py asserts
+# local versions match this file.
+
+# The NVFP4 WRITER - the component the certification most depends on (F-006).
+# First-class NVFP4 landed in 0.12.
+llmcompressor==0.12.0
+
+# The on-disk NVFP4 FORMAT CONTRACT, shared by writer and reader. llmcompressor
+# 0.12 requires ==0.17.1; vLLM 0.25 pins ==0.17.0, but no released llmcompressor
+# pins 0.17.0 (it skips 0.16.0->0.17.1), so 0.17.1 is the closest coherent
+# pairing, and 0.17.1's diff over 0.17.0 is perf/validation, NOT the on-disk
+# format. The vLLM mismatch is DELIBERATE and shows up as a pip resolver warning
+# at build time; the build gate asserts 0.17.1 won.
+compressed-tensors==0.17.1
+
+# Part of the coherent set: llmcompressor 0.12 declares <=5.10.1,>=5.9.0, so
+# 5.10.1 is the intended ceiling (verified loading Qwen2ForCausalLM on metal).
+transformers==5.10.1
+
+# The eval harness. The [math] extra is installed in its own Dockerfile line
+# (minerva hard-imports math_verify/antlr4 at task load); the version there must
+# match this pin - tests/test_build_pins.py holds the two-sided contract.
+lm-eval==0.4.12
+
+# The gate's statistics library (F-011): the certification decision uses
+# scipy.stats.sem for the paired significance test (BITE 2). Was transitive-only
+# via lm-eval; the thing the verdict rests on is pinned and declared.
+scipy==1.18.0
+
+# The GPU serving stack (F-030) - `# image-only` marks pins the DEV ENV test skips:
+# the dev box (sm_61) structurally cannot install cu129 builds, but the BUILD GATE
+# asserts them exactly like the rest by reading this file. Both install OUTSIDE the
+# constraints resolve (torch from the cu129 index, vLLM from its GitHub release
+# wheel - see deploy/Dockerfile for why), so before F-030 the gate checked only
+# cuda-tag substrings: a future bump of any constrained package could make pip's
+# resolver silently replace the preinstalled torch under the vLLM wheel's ABI
+# (compiled against torch 2.11). With these pins the same future is a LOUD resolve
+# conflict at build time, and the gate asserts the exact versions either way.
+torch==2.11.0+cu129  # image-only
+vllm==0.25.0+cu129  # image-only

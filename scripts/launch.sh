@@ -17,6 +17,10 @@ set -euo pipefail
 : "${ASSAY_VOLUME_ID:?export ASSAY_VOLUME_ID (your pre-staged weights network volume id)}"
 : "${ASSAY_IMAGE:?export ASSAY_IMAGE (ghcr.io/uistlabs/assay:TAG, PUBLIC image)}"
 : "${ASSAY_CHECKPOINT_REPO:?export ASSAY_CHECKPOINT_REPO (your target HF repo id, e.g. yourorg/Model-NVFP4A16)}"
+# Required since F-015: load_config has no weights-path default any more (the old
+# default was a Qwen path for EVERY recipe). Catch the omission HERE, at $0, not as
+# a paid pod-create that dies at boot.
+: "${ASSAY_WEIGHTS_PATH:?export ASSAY_WEIGHTS_PATH (staged base-model dir on the volume, e.g. /runpod-volume/qwen2.5-7b-instruct)}"
 
 # Digest-pin guard: a mutable tag can be served stale from RunPod's image cache - the
 # exact miss that burned a run. Require a content-addressed digest.
@@ -55,6 +59,29 @@ print(launch_reminder(r))
 
 DRY=""
 [ "${1:-}" = "--dry-run" ] && DRY="1"
+
+# Cost pre-flight: what this run costs per hour, BEFORE the spend. Read-only catalog
+# query, bounded + non-fatal - a pricing lookup must never delay or block a launch.
+# Skipped on --dry-run: a dry run's whole point is "show me the payload without
+# touching the network", and this is a live RunPod API call.
+if [ -z "$DRY" ]; then
+  timeout -k 5 30 python -c '
+import os
+from assay.cost.collect import preflight_line
+print(preflight_line(os.environ))
+' >&2 || true
+fi
+
+# Warn-only pin drift check (F-015 amendment 4): does the hub still match the
+# recipe's pinned base-model identity? Drift is INFORMATION (upstream moved since
+# pinning - re-review before re-pinning), never a block: the hard gate is the
+# in-pod verifier against the git pins, which needs no network. Bounded and
+# non-fatal like the cost pre-flight. Skipped on --dry-run (network call) and
+# under ASSAY_BASE_MODEL (the pins deliberately do not describe the overridden
+# model; the in-pod verifier stands down for the same reason).
+if [ -z "$DRY" ] && [ -z "${ASSAY_BASE_MODEL:-}" ]; then
+  timeout -k 5 30 python "$(dirname "$0")/pin_base_files.py" "${ASSAY_RECIPE:-qwen2_5_7b_instruct}" --check >&2 || true
+fi
 
 # Build the payload via the tested pure function; redact secret values for display.
 # extra_env (I3): any ASSAY_* var in the operator's shell rides along as
