@@ -9,13 +9,13 @@ set -euo pipefail
 
 # ASSAY_IMAGE must be a PUBLIC registry image. This launcher creates the pod via
 # the runpod SDK create_pod (GraphQL) path, which takes no registry-auth argument,
-# so RunPod pulls the image anonymously. Keep ghcr.io/uistlabs/assay public. To
+# so RunPod pulls the image anonymously. Keep ghcr.io/uist-labs/assay public. To
 # pull a private image, switch this create call to the REST POST /v1/pods endpoint
 # and pass containerRegistryAuthId (a deliberate follow-on, not wired here).
 : "${RUNPOD_API_KEY:?export RUNPOD_API_KEY (dedicated, pod-scoped, rotatable)}"
 : "${HF_TOKEN:?export HF_TOKEN (fine-grained, write-scoped to the target repo)}"
 : "${ASSAY_VOLUME_ID:?export ASSAY_VOLUME_ID (your pre-staged weights network volume id)}"
-: "${ASSAY_IMAGE:?export ASSAY_IMAGE (ghcr.io/uistlabs/assay:TAG, PUBLIC image)}"
+: "${ASSAY_IMAGE:?export ASSAY_IMAGE (ghcr.io/uist-labs/assay:TAG, PUBLIC image)}"
 : "${ASSAY_CHECKPOINT_REPO:?export ASSAY_CHECKPOINT_REPO (your target HF repo id, e.g. yourorg/Model-NVFP4A16)}"
 # Required since F-015: load_config has no weights-path default any more (the old
 # default was a Qwen path for EVERY recipe). Catch the omission HERE, at $0, not as
@@ -27,10 +27,10 @@ set -euo pipefail
 case "$ASSAY_IMAGE" in
   *@sha256:*) : ;;  # digest-pinned, good
   *)
-    echo "FATAL: ASSAY_IMAGE must be digest-pinned (ghcr.io/uistlabs/assay@sha256:...)." >&2
+    echo "FATAL: ASSAY_IMAGE must be digest-pinned (ghcr.io/uist-labs/assay@sha256:...)." >&2
     echo "A mutable tag can be served stale from RunPod's image cache. Get the digest" >&2
     echo "from the push output, or:" >&2
-    echo "  podman inspect --format '{{.Digest}}' ghcr.io/uistlabs/assay:<tag>" >&2
+    echo "  podman inspect --format '{{.Digest}}' ghcr.io/uist-labs/assay:<tag>" >&2
     exit 1
     ;;
 esac

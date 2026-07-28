@@ -24,7 +24,7 @@ def test_warns_when_pipeline_url_unset_on_live_cert_run(capsys):
 
 def test_silent_when_pipeline_url_is_set(capsys):
     cfg = load_config(_env(
-        ASSAY_PIPELINE_URL="https://github.com/uistlabs/assay/tree/v0.6.0"))
+        ASSAY_PIPELINE_URL="https://github.com/uist-labs/assay/tree/v0.6.0"))
     assert cfg.pipeline_url.endswith("/tree/v0.6.0")
     assert "ASSAY_PIPELINE_URL" not in capsys.readouterr().err
 

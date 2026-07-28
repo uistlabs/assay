@@ -296,7 +296,7 @@ def load_config(env: Mapping[str, str]) -> RunConfig:
         print("assay.config: ASSAY_PIPELINE_URL unset on a live cert run - the "
               "published model card will name the pipeline with no pipeline link. "
               "Set it to the TAG-PINNED repo URL, e.g. "
-              "https://github.com/uistlabs/assay/tree/v0.6.1 - a card is a frozen "
+              "https://github.com/uist-labs/assay/tree/v0.6.1 - a card is a frozen "
               "certification record, so the link must pin the exact certifying code.",
               file=sys.stderr)
 

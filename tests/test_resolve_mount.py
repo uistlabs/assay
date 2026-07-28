@@ -9,7 +9,7 @@ from assay.recipes import get_recipe
 
 _BASE = dict(
     recipe=get_recipe("qwen2_5_7b_instruct"),
-    checkpoint_repo="uistlabs/x",
+    checkpoint_repo="uist-labs/x",
     pipeline_url="",
     weights_path="/runpod-volume/qwen2.5-7b-instruct",
     artifacts_dir="/runpod-volume/assay-out/artifacts",

@@ -31,8 +31,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/uistlabs/assay"
-Repository = "https://github.com/uistlabs/assay"
+Homepage = "https://github.com/uist-labs/assay"
+Repository = "https://github.com/uist-labs/assay"
 "Published model" = "https://huggingface.co/uist-labs/Qwen2.5-7B-Instruct-NVFP4A16"
 
 [dependency-groups]

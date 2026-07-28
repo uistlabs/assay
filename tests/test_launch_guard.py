@@ -20,14 +20,14 @@ def _run(image: str) -> subprocess.CompletedProcess:
 
 
 def test_rejects_bare_tag():
-    p = _run("ghcr.io/uistlabs/assay:0.5.0")
+    p = _run("ghcr.io/uist-labs/assay:0.5.0")
     assert p.returncode != 0
     assert "digest-pinned" in p.stderr
 
 
 def test_accepts_digest():
     # Digest passes the guard; --dry-run then builds the payload and exits 0.
-    p = _run("ghcr.io/uistlabs/assay@sha256:" + "a" * 64)
+    p = _run("ghcr.io/uist-labs/assay@sha256:" + "a" * 64)
     assert p.returncode == 0, p.stderr
 
 
@@ -45,7 +45,7 @@ def test_rejects_tests_only_vars_at_launch(var, val):
         "RUNPOD_API_KEY": "dummy", "HF_TOKEN": "dummy",
         "ASSAY_VOLUME_ID": "vol", "ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16",
         "ASSAY_WEIGHTS_PATH": "/runpod-volume/model",
-        "ASSAY_IMAGE": "ghcr.io/uistlabs/assay@sha256:" + "a" * 64,
+        "ASSAY_IMAGE": "ghcr.io/uist-labs/assay@sha256:" + "a" * 64,
         var: val,
     }
     p = subprocess.run(["bash", str(LAUNCH), "--dry-run"],
@@ -63,7 +63,7 @@ def test_requires_weights_path_before_spend():
         **os.environ,
         "RUNPOD_API_KEY": "dummy", "HF_TOKEN": "dummy",
         "ASSAY_VOLUME_ID": "vol", "ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16",
-        "ASSAY_IMAGE": "ghcr.io/uistlabs/assay@sha256:" + "a" * 64,
+        "ASSAY_IMAGE": "ghcr.io/uist-labs/assay@sha256:" + "a" * 64,
     }
     env.pop("ASSAY_WEIGHTS_PATH", None)
     p = subprocess.run(["bash", str(LAUNCH), "--dry-run"],

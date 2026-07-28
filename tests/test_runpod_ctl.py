@@ -42,7 +42,7 @@ def test_payload_pins_min_download():
 
 def test_payload_pins_blackwell_and_region():
     p = build_pod_payload(
-        image="ghcr.io/uistlabs/assay:0.2.0",
+        image="ghcr.io/uist-labs/assay:0.2.0",
         volume_id="vol123",
         env_keys=["HF_TOKEN"],
         env={"HF_TOKEN": "tok"},

@@ -101,14 +101,14 @@ def test_model_card_omits_revision_line_when_unpinned():
 
 def test_card_has_citation_section():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
-                       "ASSAY_PIPELINE_URL": "https://github.com/uistlabs/assay"})
+                       "ASSAY_PIPELINE_URL": "https://github.com/uist-labs/assay"})
     card = build_model_card(cfg, _res(True))
     assert "## Citation" in card
     # BibTeX key + howpublished are derived from the repo, base cite from the recipe.
-    assert "@misc{uistlabs_model_nvfp4a16," in card
+    assert "@misc{uist_labs_model_nvfp4a16," in card
     assert "howpublished = {\\url{https://huggingface.co/myorg/Model-NVFP4A16}}" in card
     assert "Please also cite the base model" in card
-    assert "https://github.com/uistlabs/assay" in card  # pipeline url flows into the note
+    assert "https://github.com/uist-labs/assay" in card  # pipeline url flows into the note
     assert card.isascii()
 
 

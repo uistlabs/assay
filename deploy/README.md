@@ -18,7 +18,7 @@ both sides and validate load-correctness on metal (the build gate documents this
 
 Build + push:
 
-    podman build -t ghcr.io/uistlabs/assay:0.6.0 -f deploy/Dockerfile .
-    podman push ghcr.io/uistlabs/assay:0.6.0
+    podman build -t ghcr.io/uist-labs/assay:0.6.0 -f deploy/Dockerfile .
+    podman push ghcr.io/uist-labs/assay:0.6.0
 
 Weights are NOT baked - they mount from a pre-staged RunPod network volume at runtime.

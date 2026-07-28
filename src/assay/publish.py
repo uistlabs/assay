@@ -84,7 +84,7 @@ def _citation_section(runcfg: RunConfig) -> str:
     name = runcfg.checkpoint_repo.split("/")[-1]
     base = runcfg.recipe.base_model
     base_short = base.split("/")[-1]
-    key = "uistlabs_" + name.lower().replace("-", "_").replace(".", "_")
+    key = "uist_labs_" + name.lower().replace("-", "_").replace(".", "_")
     year = datetime.now(timezone.utc).year
     pipe = f" ({runcfg.pipeline_url})" if runcfg.pipeline_url else ""
     return "\n".join([
