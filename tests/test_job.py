@@ -1,9 +1,31 @@
 import pytest
+from importlib.metadata import version as _dist_version
 
 from assay.config import load_config
-from assay.job import run_job, Deps
+from assay.gate import GateResult
+from assay.job import run_job, Deps, apply_ecc_policy
 
 _INFRA_KWARGS = {"persist_path", "watchdog_factory"}
+
+
+def _capture_env(tmp_path, **overrides) -> dict:
+    """Env dict satisfying run_job's begin_capture wiring (F-009 T5): ASSAY_IMAGE +
+    ASSAY_BUILD_SHA (begin_capture hard-fails without them), and ASSAY_CONSTRAINTS_PATH
+    pointed at a tmp constraints.txt whose single pin is a REAL installed dist at its
+    REAL observed version (captured fixture, never invented). This exercises
+    begin_capture's TRUE default assert-everything path (no exclude param) without
+    hitting deploy/constraints.txt's image-only cu129 pins, which the dev box
+    legitimately does not have installed."""
+    pkg = "pytest"
+    constraints = tmp_path / "manifest_constraints.txt"
+    constraints.write_text(f"{pkg}=={_dist_version(pkg)}\n")
+    env = {
+        "ASSAY_IMAGE": "ghcr.io/uist-labs/assay@sha256:" + "a" * 64,
+        "ASSAY_BUILD_SHA": "deadbeef",
+        "ASSAY_CONSTRAINTS_PATH": str(constraints),
+    }
+    env.update(overrides)
+    return env
 
 
 def _science(kw: dict) -> dict:
@@ -37,13 +59,38 @@ def _passing_gate(*_a, **_k):
     return evaluate_gate(base, good, ("gsm8k",), "wikitext")
 
 
+def _passing_result() -> GateResult:
+    """Minimal passed GateResult - apply_ecc_policy only reads .passed/.reasons,
+    so the deltas/mean_retention fields are irrelevant filler here."""
+    return GateResult(passed=True, reasons=(), accuracy_deltas=(),
+                      perplexity_delta=None, mean_retention=1.0)
+
+
+def test_ecc_void_on_uncorrected(manifest_void):
+    r = apply_ecc_policy(_passing_result(), manifest_void)
+    assert not r.passed and any("ECC" in s for s in r.reasons)
+
+
+def test_ecc_void_on_not_captured_with_ecc(manifest_ecc_not_captured):
+    assert not apply_ecc_policy(_passing_result(), manifest_ecc_not_captured).passed
+
+
+def test_ecc_corrected_only_discloses_not_fails(manifest_corrected_only):
+    assert apply_ecc_policy(_passing_result(), manifest_corrected_only).passed
+
+
+def test_ecc_not_applicable_passes_through(manifest_no_ecc):
+    r = _passing_result()
+    assert apply_ecc_policy(r, manifest_no_ecc) == r
+
+
 def _mk_deps(calls):
     return Deps(
         quantize=lambda recipe, mp, out, hb: calls.append("quantize") or out,
         run_eval=lambda mp, tasks, hb, gmu, **kw: calls.append(f"eval:{mp}:{gmu}") or {},
         parse=lambda raw, acc, ppl, **kw: {},
         gate=lambda base, quant, acc, ppl, thr: calls.append("gate") or _passing_gate(),
-        publish=lambda runcfg, out, res, hb: calls.append("publish") or True,
+        publish=lambda runcfg, out, res, hb, manifest: calls.append("publish") or True,
     )
 
 
@@ -59,7 +106,7 @@ def test_happy_path_runs_all_stages_in_order(tmp_path):
         "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     calls = []
-    run_job(cfg, {}, _mk_deps(calls))
+    run_job(cfg, _capture_env(tmp_path), _mk_deps(calls))
     assert calls.index("quantize") < calls.index("gate") < calls.index("publish")
 
 
@@ -75,7 +122,7 @@ def test_run_eval_receives_configured_gpu_mem_util(tmp_path):
         "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     calls = []
-    run_job(cfg, {}, _mk_deps(calls))
+    run_job(cfg, _capture_env(tmp_path), _mk_deps(calls))
     evals = [c for c in calls if c.startswith("eval:")]
     assert len(evals) == 2
     assert all(c.endswith(":0.7") for c in evals)
@@ -98,7 +145,7 @@ def test_run_eval_receives_recipe_derived_chat_kwargs_identically(tmp_path):
         return {}
 
     deps = _mk_deps([])._replace(run_eval=_run_eval)
-    run_job(cfg, {}, deps)
+    run_job(cfg, _capture_env(tmp_path), deps)
     assert len(seen) == 2
     assert _science(seen[0]) == _science(seen[1])
     # qwen2_5_7b_instruct (the default recipe): mode="chat", no sampling overrides,
@@ -118,6 +165,9 @@ def test_run_eval_receives_recipe_derived_chat_kwargs_identically(tmp_path):
         # ASSAY_TIER unset -> runcfg.tier is "cert" -> eval_limit stays None, but
         # run_job always threads limit=limit as its own kwarg (Task 6).
         "limit": None,
+        # qwen2_5_7b_instruct has no gen_kwargs -> derive_max_model_len returns
+        # None (native context); Task 3 threads it into eval_kwargs regardless.
+        "max_model_len": None,
     }
 
 
@@ -142,7 +192,7 @@ def test_smoke_scales_pipeline_on_both_eval_calls(tmp_path):
         seen.append(kwargs)
         return {}
 
-    run_job(cfg, {}, _mk_deps([])._replace(run_eval=_run_eval))
+    run_job(cfg, _capture_env(tmp_path), _mk_deps([])._replace(run_eval=_run_eval))
     assert len(seen) == 2
     assert _science(seen[0]) == _science(seen[1])  # baseline and quantized scaled identically
     assert seen[0]["limit"] == 2
@@ -159,7 +209,7 @@ def test_smoke_preserves_recipe_gen_kwargs_and_overrides_max_gen_toks(tmp_path):
     recipe = replace(base, eval=replace(base.eval, gen_kwargs={"temperature": 0.6, "top_p": 0.95}))
     cfg = replace(_make_runcfg_writable(tmp_path), recipe=recipe, tier="smoke", eval_limit=2)
     seen = []
-    run_job(cfg, {}, _mk_deps([])._replace(run_eval=lambda mp, t, hb, gmu, **kw: seen.append(kw) or {}))
+    run_job(cfg, _capture_env(tmp_path), _mk_deps([])._replace(run_eval=lambda mp, t, hb, gmu, **kw: seen.append(kw) or {}))
     assert seen[0]["gen_kwargs"] == {"temperature": 0.6, "top_p": 0.95, "max_gen_toks": 8}
 
 
@@ -171,7 +221,7 @@ def test_dev_tier_scales_avg_k_and_gen_len(tmp_path):
     base = RECIPES["r1_distill_qwen_7b"]
     cfg = replace(_make_runcfg_writable(tmp_path), recipe=base, tier="dev", eval_limit=50)
     seen = []
-    run_job(cfg, {}, _mk_deps([])._replace(
+    run_job(cfg, _capture_env(tmp_path), _mk_deps([])._replace(
         run_eval=lambda mp, t, hb, gmu, **kw: seen.append(kw) or {}))
     assert seen[0]["limit"] == 50
     assert seen[0]["gen_kwargs"]["max_gen_toks"] == 4096
@@ -210,7 +260,10 @@ def test_default_deps_threads_dry_run_from_tier(tmp_path, monkeypatch):
             "ASSAY_TIER": tier,
         })
         # HF_TOKEN must be present: the publish lambda resolves it via require_secret.
-        default_deps({"HF_TOKEN": "tok"}).publish(cfg, "out", object(), None)
+        # manifest (trailing arg, F-009 T5/T8) is forwarded straight through; the
+        # monkeypatched publish_if_passed above accepts **k, so None here exercises
+        # the real call shape without needing a real ManifestV1.
+        default_deps({"HF_TOKEN": "tok"}).publish(cfg, "out", object(), None, None)
         assert captured["dry_run"] is (tier != "cert")
 
 
@@ -223,7 +276,7 @@ def test_publish_dry_run_reflects_pristine(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "dummy-token")
     seen = {}
 
-    def _fake_publish_if_passed(runcfg, out, result, token, hb, dry_run=False):
+    def _fake_publish_if_passed(runcfg, out, result, token, hb, dry_run=False, manifest=None):
         seen["dry_run"] = dry_run
         return True
 
@@ -232,12 +285,12 @@ def test_publish_dry_run_reflects_pristine(tmp_path, monkeypatch):
     # pristine cert run -> real publish (dry_run False)
     cfg = _make_runcfg_writable(tmp_path)  # tier defaults cert, pristine True
     deps = job_mod.default_deps({"HF_TOKEN": "dummy-token"})
-    deps.publish(cfg, cfg.output_dir, object(), None)
+    deps.publish(cfg, cfg.output_dir, object(), None, None)
     assert seen["dry_run"] is False
 
     # non-pristine run -> forced dry-run
     from dataclasses import replace
-    deps.publish(replace(cfg, pristine=False), cfg.output_dir, object(), None)
+    deps.publish(replace(cfg, pristine=False), cfg.output_dir, object(), None, None)
     assert seen["dry_run"] is True
 
 
@@ -256,7 +309,7 @@ def test_run_job_writes_durable_traceback_on_failure(tmp_path):
     deps = _mk_deps(calls)._replace(
         quantize=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk boom")))
     with pytest.raises(RuntimeError, match="disk boom"):
-        run_job(cfg, {}, deps)
+        run_job(cfg, _capture_env(tmp_path), deps)
     tb = (art / "traceback.txt").read_text()
     assert "RuntimeError" in tb and "disk boom" in tb
     assert "root_disk" in tb and "MemAvailable" in tb  # resource snapshot appended
@@ -273,7 +326,7 @@ def test_run_job_does_not_self_terminate(tmp_path):
         "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     calls = []
-    run_job(cfg, {}, _mk_deps(calls))
+    run_job(cfg, _capture_env(tmp_path), _mk_deps(calls))
     assert "terminate" not in calls
     assert (art / "delta-table.md").exists()  # forensics/artifacts still written
 
@@ -331,10 +384,10 @@ def _run_job_with_real_parse_and_gate(tmp_path, *, gate_passes: bool):
         run_eval=_run_eval,
         parse=parse_results,
         gate=None,  # falls back to the real evaluate_gate, same as production wiring
-        publish=lambda runcfg, out, res, hb: calls.append("publish") or True,
+        publish=lambda runcfg, out, res, hb, manifest: calls.append("publish") or True,
     )
 
-    result = run_job(cfg, {}, deps)
+    result = run_job(cfg, _capture_env(tmp_path), deps)
     assert result.passed is gate_passes
     return artifacts_dir, result
 
@@ -379,7 +432,7 @@ def test_run_eval_receives_distinct_persist_paths_and_watchdog_factory(tmp_path)
         "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
     })
     seen = []
-    run_job(cfg, {"ASSAY_RAW_LOG": "/tmp/raw.log"},
+    run_job(cfg, _capture_env(tmp_path, ASSAY_RAW_LOG="/tmp/raw.log"),
             _mk_deps([])._replace(run_eval=lambda mp, t, hb, gmu, **kw: seen.append(kw) or {}))
     assert len(seen) == 2
     persists = {kw["persist_path"] for kw in seen}
@@ -406,7 +459,7 @@ def test_run_job_keys_pairing_off_k_stderr(tmp_path):
             parse=lambda raw, acc, ppl, **kw:
                 seen.setdefault("parse", []).append(kw.get("collect_items")) or {},
             gate=lambda base, quant, acc, ppl, thr: _passing_gate(),
-            publish=lambda runcfg, out, res, hb: True,
+            publish=lambda runcfg, out, res, hb, manifest: True,
         )
 
     for recipe, expected in (("r1_distill_qwen_7b", True), ("qwen2_5_7b_instruct", False)):
@@ -419,6 +472,98 @@ def test_run_job_keys_pairing_off_k_stderr(tmp_path):
             "ASSAY_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
             "ASSAY_OUTPUT_DIR": str(tmp_path / "output"),
         })
-        run_job(cfg, {}, _deps())
+        run_job(cfg, _capture_env(tmp_path), _deps())
         assert seen["eval"] == [expected, expected], recipe   # both eval sides
         assert seen["parse"] == [expected, expected], recipe  # both parse calls
+
+
+def test_run_job_passes_identical_max_model_len_to_both_sides(tmp_path):
+    # The symmetry rule: one eval_kwargs build, both sides identical (Task 3).
+    from dataclasses import replace
+    cfg = replace(_make_runcfg_writable(tmp_path), max_model_len=36864)
+    captured = []
+
+    def _run_eval(mp, tasks, hb, gmu, **kwargs):
+        captured.append(kwargs)
+        return {}
+
+    run_job(cfg, _capture_env(tmp_path), _mk_deps([])._replace(run_eval=_run_eval))
+    assert [k.get("max_model_len") for k in captured] == [36864, 36864]
+
+
+def test_run_job_native_passes_none_to_both_sides(tmp_path):
+    # max_model_len=None (native context, the default recipe's derived value) ->
+    # both sides get None - harness/vLLM native behavior, unchanged from pre-KV-sizing.
+    cfg = _make_runcfg_writable(tmp_path)
+    assert cfg.max_model_len is None
+    captured = []
+
+    def _run_eval(mp, tasks, hb, gmu, **kwargs):
+        captured.append(kwargs)
+        return {}
+
+    run_job(cfg, _capture_env(tmp_path), _mk_deps([])._replace(run_eval=_run_eval))
+    assert [k.get("max_model_len") for k in captured] == [None, None]
+
+
+def test_run_job_writes_manifest_json_and_passes_it_to_publish(tmp_path):
+    # F-009 T5: begin/end manifest capture wired into run_job. The manifest.json
+    # copy lands in artifacts_dir (I1/I2 pattern - rides the existing artifacts
+    # trail, per spec D2/"capture point 3": never output_dir, which is the
+    # published-checkpoint dir Task 8 handles separately). deps.publish must also
+    # receive the finalized ManifestV1 as its trailing arg.
+    from assay.manifest import ManifestV1
+    art = tmp_path / "art"
+    cfg = load_config({
+        "ASSAY_ARTIFACTS_DIR": str(art),
+        "ASSAY_OUTPUT_DIR": str(tmp_path / "checkpoint"),
+        "ASSAY_HEARTBEAT": str(art / "heartbeat.log"),
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+    })
+    captured = {}
+    deps = _mk_deps([])._replace(
+        publish=lambda runcfg, out, res, hb, manifest: captured.update(manifest=manifest) or True)
+    run_job(cfg, _capture_env(tmp_path), deps)
+
+    assert isinstance(captured["manifest"], ManifestV1)
+    manifest_path = art / "manifest.json"
+    assert manifest_path.exists()
+    assert ManifestV1.from_json(manifest_path.read_text()) == captured["manifest"]
+    # image/build_sha come from env verbatim (D10) - not fabricated by job.py.
+    assert captured["manifest"].image.startswith("ghcr.io/uist-labs/assay@sha256:")
+    assert captured["manifest"].build_sha == "deadbeef"
+    assert captured["manifest"].capture.end_utc is not None
+
+
+def test_run_job_wires_ecc_void_into_delta_table_and_publish(tmp_path, monkeypatch, manifest_void):
+    # F-009 T6 ordering subtlety: apply_ecc_policy runs AFTER finalize (needs the
+    # real ecc_window) but its override must still reach every downstream
+    # consumer of `result` - the persisted delta-table.md, deps.publish, and
+    # run_job's own return value - not just the in-memory GateResult. This pins
+    # that the delta-table write and hb "gate" marker were moved to AFTER the
+    # override (they used to run before finalize even existed). finalize() is
+    # patched to return manifest_void (real hardware on this box has no ECC, so
+    # the void path is otherwise unreachable end-to-end without a real ECC GPU).
+    monkeypatch.setattr("assay.manifest.finalize", lambda begin, run=None: manifest_void)
+    art = tmp_path / "art"
+    cfg = load_config({
+        "ASSAY_ARTIFACTS_DIR": str(art),
+        "ASSAY_OUTPUT_DIR": str(tmp_path / "checkpoint"),
+        "ASSAY_HEARTBEAT": str(art / "heartbeat.log"),
+        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
+    })
+    captured = {}
+    deps = _mk_deps([])._replace(  # _mk_deps' gate stub is a PASSING gate
+        publish=lambda runcfg, out, res, hb, manifest: captured.update(result=res) or True)
+
+    result = run_job(cfg, _capture_env(tmp_path), deps)
+
+    # Return value: the void override, not the underlying passing gate.
+    assert not result.passed
+    assert any("ECC" in r for r in result.reasons)
+    # publish saw the SAME overridden result.
+    assert captured["result"] is result
+    # The persisted delta table reflects the override, not the pre-override PASS.
+    delta_table = (art / "delta-table.md").read_text()
+    assert "FAIL" in delta_table
+    assert "ECC" in delta_table

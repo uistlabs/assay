@@ -154,12 +154,25 @@ def parse_results(raw: dict, accuracy_tasks, perplexity, *,
     return out
 
 
+def _model_args(model_path: str, gpu_mem_util: float,
+                max_model_len: "int | None") -> str:
+    """vLLM model_args string. max_model_len=None means native context (string is
+    then byte-identical to the pre-KV-sizing form). When set, it is ALWAYS the
+    recipe-derived value handed identically to both eval sides (symmetry rule -
+    see config.derive_max_model_len)."""
+    args = f"pretrained={model_path},dtype=auto,gpu_memory_utilization={gpu_mem_util}"
+    if max_model_len is not None:
+        args += f",max_model_len={max_model_len}"
+    return args
+
+
 def _eval_child(conn, model_path: str, tasks: list[str], gpu_mem_util: float,
                 apply_chat_template: bool = False, fewshot_as_multiturn: bool = False,
                 gen_kwargs: dict | None = None, system_instruction: str | None = None,
                 include_path: str | None = None, repeats: dict | None = None,
                 limit: int | None = None, persist_path: str | None = None,
-                capture_per_item: bool = False) -> None:
+                capture_per_item: bool = False,
+                max_model_len: "int | None" = None) -> None:
     """Subprocess body for ONE lm-eval run. Ships ("ok", results) or
     ("err", traceback-string) back over conn. Module-level so the spawn
     context can import it by reference in the child interpreter."""
@@ -187,8 +200,7 @@ def _eval_child(conn, model_path: str, tasks: list[str], gpu_mem_util: float,
                 override[name].set_config("repeats", int(k))
         raw = simple_evaluate(
             model="vllm",
-            model_args=(f"pretrained={model_path},dtype=auto,"
-                        f"gpu_memory_utilization={gpu_mem_util}"),
+            model_args=_model_args(model_path, gpu_mem_util, max_model_len),
             tasks=_mixed_task_specs(tasks, override),
             batch_size="auto",
             apply_chat_template=apply_chat_template,
@@ -252,7 +264,7 @@ def run_eval(model_path: str, tasks: list[str], hb=None,
              gen_kwargs: dict | None = None, system_instruction: str | None = None,
              include_path: str | None = None, repeats: dict | None = None,
              limit: int | None = None, persist_path: str | None = None,
-             capture_per_item: bool = False,
+             capture_per_item: bool = False, max_model_len: "int | None" = None,
              watchdog_factory=None, join_timeout: float = 120.0) -> dict:
     """Run lm-evaluation-harness on a local model path; return raw results dict.
 
@@ -266,7 +278,8 @@ def run_eval(model_path: str, tasks: list[str], hb=None,
     fork)."""
     if hb:
         hb.emit("evaluate", f"lm-eval {model_path} tasks={','.join(tasks)} "
-                            f"chat={apply_chat_template} gpu_mem_util={gpu_mem_util} (subprocess)")
+                            f"chat={apply_chat_template} gpu_mem_util={gpu_mem_util} "
+                            f"max_model_len={max_model_len} (subprocess)")
     if persist_path:
         # A STALE file left by a prior run/eval that reused this path must never be
         # mistaken for THIS eval's result: if this child dies before writing, the
@@ -283,7 +296,7 @@ def run_eval(model_path: str, tasks: list[str], hb=None,
                        args=(send_conn, model_path, list(tasks), gpu_mem_util,
                              apply_chat_template, fewshot_as_multiturn, gen_kwargs,
                              system_instruction, include_path, repeats, limit,
-                             persist_path, capture_per_item))
+                             persist_path, capture_per_item, max_model_len))
     proc.start()
     send_conn.close()  # parent's copy of the write end; the child holds the live one
     watchdog = None
@@ -316,8 +329,22 @@ def run_eval(model_path: str, tasks: list[str], hb=None,
     # The headline must name the ACTUAL cause. Metal Phase B proved the generic
     # "CUDA error or OOM kill" text fires on the watchdog-kill path, where neither
     # happened - sending a 2 AM operator hunting a crash that does not exist. The
-    # watchdog knows whether it fired, so ask it rather than guessing.
-    if getattr(watchdog, "killed", False):
+    # watchdog knows whether it fired AND why (whole-branch review FIX 3 / F-047:
+    # the prior `getattr(watchdog, "killed", False)` read an attribute the real
+    # StallWatchdog never set - only the private `_killed` - so this branch was
+    # dead on the live path; killed_reason is the real, public attribute).
+    reason = getattr(watchdog, "killed_reason", None)
+    if reason is not None and reason.startswith("ECC_VOID"):
+        raise RuntimeError(
+            f"eval subprocess for {model_path} was KILLED BY THE ECC FAIL-FAST "
+            f"(exitcode={proc.exitcode}): {reason}. This is a HARDWARE FAULT, not "
+            "a stall: an uncorrected ECC error during the measurement window "
+            "voids the run under the D3 gate policy (F-009 stack + hardware "
+            "manifest). Re-run once the host's ECC health is confirmed, or on a "
+            "different host - this is not a timing problem, so raising the stall "
+            "threshold will not help."
+        )
+    if reason is not None:
         raise RuntimeError(
             f"eval subprocess for {model_path} was KILLED BY THE STALL WATCHDOG "
             f"(exitcode={proc.exitcode}): every liveness signal (stdout mtime, GPU "

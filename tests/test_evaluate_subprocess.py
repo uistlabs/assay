@@ -16,12 +16,14 @@ import pytest
 
 from assay import evaluate
 from assay.heartbeat import Heartbeat
+from assay.watchdog import StallWatchdog
 
 
 def _child_ok(conn, model_path, tasks, gpu_mem_util,
              apply_chat_template=False, fewshot_as_multiturn=False,
              gen_kwargs=None, system_instruction=None,
-             include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
+             include_path=None, repeats=None, limit=None, persist_path=None,
+             capture_per_item=False, max_model_len=None):
     # Echo the inputs back so the test proves they crossed the process
     # boundary intact (tasks list, knob value), not just that SOMETHING ran.
     conn.send(("ok", {"path": model_path, "tasks": tasks, "gmu": gpu_mem_util}))
@@ -31,7 +33,8 @@ def _child_ok(conn, model_path, tasks, gpu_mem_util,
 def _child_err(conn, model_path, tasks, gpu_mem_util,
                apply_chat_template=False, fewshot_as_multiturn=False,
                gen_kwargs=None, system_instruction=None,
-               include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
+               include_path=None, repeats=None, limit=None, persist_path=None,
+               capture_per_item=False, max_model_len=None):
     conn.send(("err", "Traceback (most recent call last):\nValueError: boom"))
     conn.close()
     raise SystemExit(1)
@@ -40,7 +43,8 @@ def _child_err(conn, model_path, tasks, gpu_mem_util,
 def _child_dies_silently(conn, model_path, tasks, gpu_mem_util,
                          apply_chat_template=False, fewshot_as_multiturn=False,
                          gen_kwargs=None, system_instruction=None,
-                         include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
+                         include_path=None, repeats=None, limit=None, persist_path=None,
+                         capture_per_item=False, max_model_len=None):
     # Simulate a hard native crash (CUDA abort, OOM kill): no message, no
     # clean close, nonzero exit. os._exit skips interpreter cleanup entirely.
     os._exit(3)
@@ -48,7 +52,8 @@ def _child_dies_silently(conn, model_path, tasks, gpu_mem_util,
 
 def _child_echo_kwargs(conn, model_path, tasks, gpu_mem_util,
                        apply_chat_template, fewshot_as_multiturn, gen_kwargs, system_instruction,
-                       include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
+                       include_path=None, repeats=None, limit=None, persist_path=None,
+                       capture_per_item=False, max_model_len=None):
     conn.send(("ok", {
         "apply_chat_template": apply_chat_template,
         "fewshot_as_multiturn": fewshot_as_multiturn,
@@ -85,7 +90,8 @@ def test_run_eval_raises_on_silent_child_death(monkeypatch):
 def _child_echo_limit(conn, model_path, tasks, gpu_mem_util,
                       apply_chat_template=False, fewshot_as_multiturn=False,
                       gen_kwargs=None, system_instruction=None,
-                      include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
+                      include_path=None, repeats=None, limit=None, persist_path=None,
+                      capture_per_item=False, max_model_len=None):
     conn.send(("ok", {"limit": limit}))
     conn.close()
 
@@ -122,7 +128,8 @@ def test_run_eval_forwards_include_path_and_repeats(monkeypatch):
 
     def fake_child(conn, model_path, tasks, gpu_mem_util, apply_chat_template=False,
                    fewshot_as_multiturn=False, gen_kwargs=None, system_instruction=None,
-                   include_path=None, repeats=None, limit=None, persist_path=None, capture_per_item=False):
+                   include_path=None, repeats=None, limit=None, persist_path=None,
+                   capture_per_item=False, max_model_len=None):
         conn.send(("ok", {"include_path": include_path, "repeats": repeats}))
         conn.close()
 
@@ -352,7 +359,7 @@ def _child_persists_then_dies(conn, model_path, tasks, gpu_mem_util,
                               apply_chat_template=False, fewshot_as_multiturn=False,
                               gen_kwargs=None, system_instruction=None,
                               include_path=None, repeats=None, limit=None,
-                              persist_path=None, capture_per_item=False):
+                              persist_path=None, capture_per_item=False, max_model_len=None):
     # Completed the eval and PERSISTED, then died before/without a clean send
     # (the wedge-then-kill signature). The parent must recover from persist_path.
     with open(persist_path, "w") as fh:
@@ -413,28 +420,44 @@ def test_run_eval_starts_and_stops_watchdog_with_child_pid(monkeypatch):
     assert events[0][1] > 0  # a real pid was passed
 
 
-class _FakeWatchdog:
-    """Minimal StallWatchdog stand-in: records start/stop and reports whether it
-    fired the kill. `killed` is the real class's public flag (watchdog.py)."""
-
-    def __init__(self, killed):
-        self.killed = killed
-        self.started = False
-        self.stopped = False
-
-    def start(self):
-        self.started = True
-
-    def stop(self):
-        self.stopped = True
+def _prekilled_watchdog(reason):
+    """A REAL StallWatchdog whose `_abort()` has already fired through the real
+    method (whole-branch review FIX 3 / F-047: the old test pinned a mock's
+    `.killed` boolean, which the getattr evaluate.py actually read - `killed`,
+    not the real class's private `_killed` - was always False, so the F-016
+    labeling was dead on the live path). Exercising the real
+    `killed_reason` attribute here is the point of the fix."""
+    wd = StallWatchdog(signals=[], on_stall=lambda: None, threshold=100.0)
+    wd._abort(reason)
+    return wd
 
 
-def test_dead_child_after_watchdog_kill_names_the_watchdog_not_cuda(monkeypatch):
-    """F-016: the dead-child headline must not send a 2 AM operator hunting a CUDA
-    error or an OOM kill when the StallWatchdog is what killed the eval. Metal
-    Phase B proved this exact misattribution on the watchdog-kill path."""
+def test_dead_child_after_ecc_fatal_kill_names_ecc_not_stall(monkeypatch):
+    """F-009 D6 / whole-branch review FIX 3: an ECC_VOID kill is a HARDWARE fault
+    under the D3 gate policy, not a stall - the headline must say so and must
+    NOT suggest raising ASSAY_STALL_SECONDS, which does not apply to a hardware
+    fault and would send an operator tuning the wrong knob."""
     monkeypatch.setattr(evaluate, "_eval_child", _child_dies_silently)
-    wd = _FakeWatchdog(killed=True)
+    wd = _prekilled_watchdog("ECC_VOID: uncorrected errors during measurement (1)")
+    with pytest.raises(RuntimeError) as excinfo:
+        evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork",
+                          watchdog_factory=lambda pid, hb: wd)
+    msg = str(excinfo.value)
+    assert "ECC" in msg
+    assert "hardware" in msg.lower()
+    assert "ASSAY_STALL_SECONDS" not in msg      # not a knob that applies here
+    assert "CUDA" not in msg and "OOM" not in msg  # the wrong cause must be absent
+    assert msg.isascii()
+
+
+def test_dead_child_after_watchdog_stall_kill_names_the_watchdog_not_cuda(monkeypatch):
+    """F-016 (behavior unchanged, now driven by the real `killed_reason` attribute
+    instead of a dead getattr): the dead-child headline must not send a 2 AM
+    operator hunting a CUDA error or an OOM kill when the StallWatchdog is what
+    killed the eval. Metal Phase B proved this exact misattribution."""
+    monkeypatch.setattr(evaluate, "_eval_child", _child_dies_silently)
+    wd = _prekilled_watchdog(
+        "watchdog stall - every available signal flat past threshold (1800s)")
     with pytest.raises(RuntimeError) as excinfo:
         evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork",
                           watchdog_factory=lambda pid, hb: wd)
@@ -447,10 +470,11 @@ def test_dead_child_after_watchdog_kill_names_the_watchdog_not_cuda(monkeypatch)
 
 
 def test_dead_child_without_watchdog_kill_keeps_cuda_oom_guidance(monkeypatch):
-    """The CUDA/OOM guidance is correct when the watchdog did NOT fire - the fix
-    must narrow the message, not replace one misattribution with another."""
+    """The CUDA/OOM guidance is correct when the watchdog did NOT fire (a real,
+    never-aborted StallWatchdog: killed_reason stays None) - the fix must narrow
+    the message, not replace one misattribution with another."""
     monkeypatch.setattr(evaluate, "_eval_child", _child_dies_silently)
-    wd = _FakeWatchdog(killed=False)
+    wd = StallWatchdog(signals=[], on_stall=lambda: None, threshold=100.0)
     with pytest.raises(RuntimeError, match=r"CUDA error or OOM kill"):
         evaluate.run_eval("/m", ["gsm8k"], None, 0.85, mp_context="fork",
                           watchdog_factory=lambda pid, hb: wd)

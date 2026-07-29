@@ -323,3 +323,139 @@ def test_stall_drill_warning_tolerates_malformed_values():
                                          "ASSAY_STALL_SECONDS": "1800"}) is None
     assert watchdog.stall_drill_warning({"ASSAY_INJECT_STALL_AFTER": "60",
                                          "ASSAY_STALL_SECONDS": "never"}) is None
+
+
+# --- F-009 T7: mid-run ECC fail-fast rides the watchdog tick (D6) ---------------
+
+def test_fatal_check_kills_on_first_tick_without_stall_threshold():
+    """A fatal_check reason must abort on the TICK it is detected - it must not
+    require the stall threshold to have elapsed (that is the whole point of a
+    fail-fast: an uncorrected ECC error is a terminal fact under D3, not a
+    slow-progress signal)."""
+    clock = {"t": 0.0}
+    killed = {"n": 0}
+    wd = StallWatchdog(
+        signals=[_counter_signal("stdout", [1, 2, 3])],  # actively progressing
+        on_stall=lambda: killed.__setitem__("n", killed["n"] + 1),
+        threshold=1_000_000.0,  # would never trip on stall alone
+        clock=lambda: clock["t"],
+        fatal_check=lambda: "ECC_VOID: uncorrected errors during measurement (1)")
+    clock["t"] = 10.0
+    assert wd._tick() is True
+    assert killed["n"] == 1
+
+
+def test_fatal_check_returning_none_does_not_kill():
+    clock = {"t": 0.0}
+    killed = {"n": 0}
+    wd = StallWatchdog(
+        signals=[_counter_signal("stdout", [1, 1, 1])],
+        on_stall=lambda: killed.__setitem__("n", killed["n"] + 1),
+        threshold=1_000_000.0, clock=lambda: clock["t"],
+        fatal_check=lambda: None)
+    clock["t"] = 10.0
+    assert wd._tick() is False
+    assert killed["n"] == 0
+
+
+def test_fatal_check_reason_reaches_heartbeat_via_existing_kill_path(tmp_path):
+    """The abort reason must land in the heartbeat through the SAME on-stall
+    reporting the progress beat already uses (self.heartbeat) - the reader pod
+    already exfiltrates the heartbeat log, so this satisfies "reason published to
+    the artifact trail" without any new reporting surface."""
+    from assay.heartbeat import Heartbeat
+    hb = Heartbeat(str(tmp_path / "hb.log"))
+    clock = {"t": 0.0}
+    reason = "ECC_VOID: uncorrected errors during measurement (2)"
+    wd = StallWatchdog(
+        signals=[_counter_signal("stdout", [1, 2, 3])],
+        on_stall=lambda: None, threshold=1_000_000.0, heartbeat=hb,
+        clock=lambda: clock["t"], fatal_check=lambda: reason)
+    clock["t"] = 10.0
+    assert wd._tick() is True
+    log_text = (tmp_path / "hb.log").read_text()
+    assert reason in log_text
+
+
+def test_fatal_check_reason_printed_to_stderr_for_the_raw_log(capsys):
+    """The raw pod log is a tee of the WHOLE pod's stdout/stderr (log_tee), so a
+    print here is how the reason reaches "raw log" - same pattern as the existing
+    ASSAY_STALL_SECONDS warnings in this module (print(..., file=sys.stderr))."""
+    clock = {"t": 0.0}
+    reason = "ECC_VOID: uncorrected errors during measurement (3)"
+    wd = StallWatchdog(
+        signals=[_counter_signal("stdout", [1, 2, 3])],
+        on_stall=lambda: None, threshold=1_000_000.0,
+        clock=lambda: clock["t"], fatal_check=lambda: reason)
+    clock["t"] = 10.0
+    assert wd._tick() is True
+    assert reason in capsys.readouterr().err
+
+
+def test_plain_stall_reason_also_reaches_heartbeat(tmp_path):
+    """The reporting is unified (one code path, not duplicated for fatal vs plain
+    stall) - a plain stall-timeout kill reports too, not only a fatal_check kill."""
+    from assay.heartbeat import Heartbeat
+    hb = Heartbeat(str(tmp_path / "hb.log"))
+    clock = {"t": 0.0}
+    wd = StallWatchdog(
+        signals=[_counter_signal("stdout", [1, 1, 1])],
+        on_stall=lambda: None, threshold=100.0, heartbeat=hb,
+        clock=lambda: clock["t"])
+    clock["t"] = 10.0; wd._tick()
+    clock["t"] = 180.0
+    assert wd._tick() is True
+    assert "stall" in (tmp_path / "hb.log").read_text().lower()
+
+
+def test_fatal_check_none_when_disarmed_never_called(monkeypatch):
+    """Sanity for the disarmed default: with no fatal_check, _tick never calls
+    anything named fatal_check and behaves exactly as before (stall-only)."""
+    clock = {"t": 0.0}
+    killed = {"n": 0}
+    wd = StallWatchdog(
+        signals=[_counter_signal("stdout", [1, 1, 1])],
+        on_stall=lambda: killed.__setitem__("n", killed["n"] + 1),
+        threshold=100.0, clock=lambda: clock["t"])
+    clock["t"] = 10.0
+    assert wd._tick() is False
+    assert killed["n"] == 0
+
+
+# --- ECC fatal-check closure (build_eval_watchdog wiring) -----------------------
+
+def test_build_eval_watchdog_ecc_closure_positive_delta_reason(monkeypatch):
+    from assay import watchdog as wd_mod
+    monkeypatch.setattr(wd_mod.manifest, "read_ecc_counters", lambda run=None: (1, 0))
+    wd = wd_mod.build_eval_watchdog(12345, None, None, {}, ecc_begin=(0, 0))
+    assert wd.fatal_check is not None
+    assert wd.fatal_check() == "ECC_VOID: uncorrected errors during measurement (1)"
+
+
+def test_build_eval_watchdog_ecc_closure_no_delta_returns_none(monkeypatch):
+    from assay import watchdog as wd_mod
+    monkeypatch.setattr(wd_mod.manifest, "read_ecc_counters", lambda run=None: (0, 3))
+    wd = wd_mod.build_eval_watchdog(12345, None, None, {}, ecc_begin=(0, 0))
+    assert wd.fatal_check() is None
+
+
+def test_build_eval_watchdog_ecc_closure_unreadable_current_returns_none(monkeypatch):
+    """A mid-run read flake (None) merely loses earliness, never correctness - the
+    end-capture still voids on not-captured."""
+    from assay import watchdog as wd_mod
+    monkeypatch.setattr(wd_mod.manifest, "read_ecc_counters", lambda run=None: None)
+    wd = wd_mod.build_eval_watchdog(12345, None, None, {}, ecc_begin=(0, 0))
+    assert wd.fatal_check() is None
+
+
+def test_build_eval_watchdog_disarmed_when_ecc_begin_is_none():
+    from assay.watchdog import build_eval_watchdog
+    wd = build_eval_watchdog(12345, None, None, {}, ecc_begin=None)
+    assert wd.fatal_check is None
+
+
+def test_build_eval_watchdog_default_disarmed_without_ecc_begin_kwarg():
+    """Callers that don't pass ecc_begin at all (backward compat) stay disarmed."""
+    from assay.watchdog import build_eval_watchdog
+    wd = build_eval_watchdog(12345, None, None, {})
+    assert wd.fatal_check is None

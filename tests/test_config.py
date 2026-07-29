@@ -119,6 +119,25 @@ def test_require_secret_missing_raises():
         require_secret({}, "HF_TOKEN")
 
 
+def test_require_secret_strips_edge_whitespace():
+    # F-043: a trailing newline/CR from a key file embedded verbatim into a pod's
+    # env makes every in-pod Bearer header malformed - the same 403-forever
+    # signature as the 07-28 drill, from a stray byte. Strip it at the one gate.
+    assert require_secret({"HF_TOKEN": "abc\n"}, "HF_TOKEN") == "abc"
+    assert require_secret({"HF_TOKEN": " abc\r\n"}, "HF_TOKEN") == "abc"
+
+
+def test_require_secret_rejects_interior_whitespace():
+    # Interior whitespace cannot be silently repaired - loud, actionable, $0.
+    with pytest.raises(ValueError, match="whitespace"):
+        require_secret({"HF_TOKEN": "ab c"}, "HF_TOKEN")
+
+
+def test_require_secret_whitespace_only_is_missing():
+    with pytest.raises(ValueError, match="HF_TOKEN is required"):
+        require_secret({"HF_TOKEN": " \n"}, "HF_TOKEN")
+
+
 # I2 guard: publish uploads output_dir wholesale to the public HF repo, so ops
 # artifacts (heartbeat log, eval JSONs, delta table) must never live at or
 # under output_dir. A stale ASSAY_OUTPUT_DIR reintroducing the old shared
@@ -342,3 +361,162 @@ def test_pristine_has_no_default_so_a_bypassing_caller_cannot_forget_it():
     assert field.default is dataclasses.MISSING, \
         "pristine must be required - a publish-integrity bit is never defaulted"
     assert field.default_factory is dataclasses.MISSING
+
+
+def test_derive_max_model_len_generative_recipe():
+    # R1 pins max_gen_toks 32768 -> 32768 + 4096 = 36864 (spec-locked value)
+    from assay.config import PROMPT_HEADROOM, derive_max_model_len
+    from assay.recipes import get_recipe
+
+    r1 = get_recipe("r1_distill_qwen_7b")
+    assert derive_max_model_len(r1, {}) == 36864
+    assert PROMPT_HEADROOM == 4096
+
+
+def test_derive_max_model_len_mc_recipe_is_none():
+    # Qwen's battery is MC/loglikelihood (no max_gen_toks): native context,
+    # byte-identical behavior to today.
+    from assay.config import derive_max_model_len
+    from assay.recipes import get_recipe
+
+    qwen = get_recipe("qwen2_5_7b_instruct")
+    assert derive_max_model_len(qwen, {}) is None
+
+
+def test_derive_max_model_len_override_wins_and_is_clamp_input():
+    from assay.config import derive_max_model_len
+    from assay.recipes import get_recipe
+
+    r1 = get_recipe("r1_distill_qwen_7b")
+    assert derive_max_model_len(r1, {"ASSAY_MAX_MODEL_LEN": "40000"}) == 40000
+
+
+def test_derive_max_model_len_override_below_gen_cap_refused():
+    # An override <= max_gen_toks would silently truncate generation - the
+    # silent-eval-change direction. Refused loudly.
+    from assay.config import derive_max_model_len
+    from assay.recipes import get_recipe
+
+    r1 = get_recipe("r1_distill_qwen_7b")
+    with pytest.raises(ValueError, match="silently truncated"):
+        derive_max_model_len(r1, {"ASSAY_MAX_MODEL_LEN": "32768"})
+
+
+def test_derive_max_model_len_override_zero_and_junk_refused():
+    from assay.config import derive_max_model_len
+    from assay.recipes import get_recipe
+
+    r1 = get_recipe("r1_distill_qwen_7b")
+    with pytest.raises(ValueError, match="positive"):
+        derive_max_model_len(r1, {"ASSAY_MAX_MODEL_LEN": "0"})
+    with pytest.raises(ValueError, match="integer"):
+        derive_max_model_len(r1, {"ASSAY_MAX_MODEL_LEN": "native"})
+
+
+def test_max_model_len_override_breaks_pristine():
+    # Measurement geometry is part of the certified methodology: overriding it
+    # must force dry-run. Build a full valid cert-tier env, then:
+    from assay.config import load_config
+
+    env = _env()
+    assert load_config(env).pristine is True
+    env["ASSAY_MAX_MODEL_LEN"] = "40000"
+    cfg = load_config(env)
+    assert cfg.pristine is False
+    assert cfg.max_model_len == 40000
+
+
+def test_gpu_mem_util_override_breaks_pristine():
+    # ASSAY_GPU_MEM_UTIL is measurement geometry (the other term in KV-cache
+    # sizing, alongside max_model_len): a lingering override changes the eval
+    # engine's memory geometry, so a pristine cert minted under it would be a
+    # false-pass path (final-review finding). Build a full valid cert-tier env,
+    # then override:
+    from assay.config import load_config
+
+    env = _env()
+    assert load_config(env).pristine is True
+    env["ASSAY_GPU_MEM_UTIL"] = "0.70"
+    cfg = load_config(env)
+    assert cfg.pristine is False
+    assert cfg.gpu_mem_util == 0.70
+
+
+def test_constraints_path_override_breaks_pristine():
+    # ASSAY_CONSTRAINTS_PATH (F-009 T5, run_job's begin_capture wiring) redirects
+    # the runtime pin cross-assert to an arbitrary file - unregistered, a
+    # lingering override on a cert-tier run would point the stack assert at a
+    # file engineered to always match while still minting a REAL certificate
+    # (the F-026 defect family: an override missing from the pristine guard's
+    # table). Build a full valid cert-tier env, then override:
+    from assay.config import load_config
+
+    env = _env()
+    assert load_config(env).pristine is True
+    env["ASSAY_CONSTRAINTS_PATH"] = "/tmp/whatever-constraints.txt"
+    cfg = load_config(env)
+    assert cfg.pristine is False
+
+
+def test_load_config_populates_candidate():
+    from assay.config import load_config
+
+    env = _env()
+    # r1 env -> candidate 36864 before any clamp
+    cfg = load_config(env)
+    expected = 36864 if cfg.recipe.slug == "r1_distill_qwen_7b" else None
+    assert cfg.max_model_len == expected
+
+
+def _cfg_with_candidate(candidate):
+    """Helper to build a config with a specific max_model_len candidate."""
+    from dataclasses import replace
+    cfg = load_config(_env())
+    return replace(cfg, max_model_len=candidate)
+
+
+def test_clamp_below_native_keeps_candidate(capsys):
+    from assay.config import clamp_max_model_len
+    cfg = _cfg_with_candidate(36864)
+    out = clamp_max_model_len(cfg, reader=lambda p: {"max_position_embeddings": 131072})
+    assert out.max_model_len == 36864
+
+
+def test_clamp_at_or_above_native_returns_none():
+    from assay.config import clamp_max_model_len
+    # Never raise above native, never pass a redundant cap (spec).
+    cfg = _cfg_with_candidate(40000)
+    out = clamp_max_model_len(cfg, reader=lambda p: {"max_position_embeddings": 32768})
+    assert out.max_model_len is None
+    out2 = clamp_max_model_len(
+        _cfg_with_candidate(32768),
+        reader=lambda p: {"max_position_embeddings": 32768})
+    assert out2.max_model_len is None
+
+
+def test_clamp_none_candidate_is_noop_and_reads_nothing():
+    from assay.config import clamp_max_model_len
+    cfg = _cfg_with_candidate(None)
+    def boom(path):
+        raise AssertionError("must not read config.json when candidate is None")
+    assert clamp_max_model_len(cfg, reader=boom).max_model_len is None
+
+
+def test_clamp_unreadable_config_keeps_candidate_with_warning(capsys):
+    from assay.config import clamp_max_model_len
+    # Fail-open here is safe: a too-high candidate fails LOUDLY at vLLM startup;
+    # silently dropping the cap would silently change measurement geometry.
+    cfg = _cfg_with_candidate(36864)
+    def boom(path):
+        raise OSError("no such file")
+    out = clamp_max_model_len(cfg, reader=boom)
+    assert out.max_model_len == 36864
+    assert "config.json" in capsys.readouterr().err
+
+
+def test_clamp_missing_key_keeps_candidate_with_warning(capsys):
+    from assay.config import clamp_max_model_len
+    cfg = _cfg_with_candidate(36864)
+    out = clamp_max_model_len(cfg, reader=lambda p: {"architectures": ["X"]})
+    assert out.max_model_len == 36864
+    assert "max_position_embeddings" in capsys.readouterr().err

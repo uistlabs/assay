@@ -72,6 +72,42 @@ def test_requires_weights_path_before_spend():
     assert "ASSAY_WEIGHTS_PATH" in p.stderr
 
 
+def test_rejects_junk_max_model_len_before_spend():
+    """derive_max_model_len (assay.config) raises loudly on a junk
+    ASSAY_MAX_MODEL_LEN (non-integer, non-positive, or <= the recipe's
+    max_gen_toks). The launch-side reminder block must run that same validation
+    on the operator's box at $0, so a junk value fails before a paid pod create +
+    image pull, not at pod boot."""
+    env = {
+        **os.environ,
+        "RUNPOD_API_KEY": "dummy", "HF_TOKEN": "dummy",
+        "ASSAY_VOLUME_ID": "vol", "ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/runpod-volume/model",
+        "ASSAY_IMAGE": "ghcr.io/uist-labs/assay@sha256:" + "a" * 64,
+        "ASSAY_MAX_MODEL_LEN": "0",
+    }
+    p = subprocess.run(["bash", str(LAUNCH), "--dry-run"],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert p.returncode != 0
+    assert "ASSAY_MAX_MODEL_LEN" in p.stderr
+    assert "positive" in p.stderr
+
+
+def test_accepts_valid_max_model_len():
+    """A valid override still reaches --dry-run success unchanged."""
+    env = {
+        **os.environ,
+        "RUNPOD_API_KEY": "dummy", "HF_TOKEN": "dummy",
+        "ASSAY_VOLUME_ID": "vol", "ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16",
+        "ASSAY_WEIGHTS_PATH": "/runpod-volume/model",
+        "ASSAY_IMAGE": "ghcr.io/uist-labs/assay@sha256:" + "a" * 64,
+        "ASSAY_MAX_MODEL_LEN": "40000",
+    }
+    p = subprocess.run(["bash", str(LAUNCH), "--dry-run"],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert p.returncode == 0, p.stderr
+
+
 def test_pin_drift_check_is_wired_warn_only():
     """F-015 amendment 4: the launch-side hub cross-check of the recipe's identity
     pins. Contract-grep (same style as the pod_entry marker test): it must exist,
@@ -85,3 +121,42 @@ def test_pin_drift_check_is_wired_warn_only():
     assert "|| true" in check_line or "|| true" in text.split("pin_base_files.py")[1][:200]
     assert "timeout" in check_line
     assert "ASSAY_BASE_MODEL" in text
+
+
+# ---- F-040 reader hook ----
+_READER_ENV = {
+    **os.environ,
+    "RUNPOD_API_KEY": "dummy", "HF_TOKEN": "dummy",
+    "ASSAY_VOLUME_ID": "vol", "ASSAY_CHECKPOINT_REPO": "org/M-NVFP4A16",
+    "ASSAY_WEIGHTS_PATH": "/runpod-volume/model",
+    "ASSAY_IMAGE": "ghcr.io/uist-labs/assay@sha256:" + "a" * 64,
+}
+
+
+def _dry(extra: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(["bash", str(LAUNCH), "--dry-run"],
+                          capture_output=True, text=True,
+                          env={**_READER_ENV, **extra}, timeout=60)
+
+
+def test_reader_hook_prints_payload_on_dry_run():
+    p = _dry({"ASSAY_ARTIFACTS_DATASET": "org/run-artifacts"})
+    assert p.returncode == 0, p.stderr
+    assert "reader payload" in p.stdout
+    assert "assay-reader-DRY-RUN" in p.stdout
+    assert "dummy" not in p.stdout  # secrets redacted in the printed payload
+
+
+def test_reader_hook_skips_loudly_without_dataset():
+    # R-5: a reader with no destination must never be created.
+    p = _dry({})
+    assert p.returncode == 0, p.stderr
+    assert "no ASSAY_ARTIFACTS_DATASET" in p.stderr
+    assert "reader payload" not in p.stdout
+
+
+def test_reader_hook_respects_opt_out():
+    p = _dry({"ASSAY_ARTIFACTS_DATASET": "org/run-artifacts", "ASSAY_READER": "0"})
+    assert p.returncode == 0, p.stderr
+    assert "reader disabled" in p.stderr
+    assert "reader payload" not in p.stdout

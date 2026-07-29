@@ -4,6 +4,8 @@ from assay.runpod_ctl import (
     build_pod_payload, self_terminate, RTX_5090, REGION,
     CONTAINER_DISK_GB, MIN_MEMORY_GB, MIN_VCPU, CLOUD_TYPE,
     ALLOWED_CUDA_VERSIONS, MIN_DOWNLOAD_MBPS,
+    list_assay_pods, parse_fleet_expected, fleet_stray_warning_lines,
+    READER_NAME_PREFIX, build_reader_payload,
 )
 
 
@@ -123,6 +125,22 @@ def test_self_terminate_missing_id_raises():
         self_terminate({"RUNPOD_API_KEY": "k"}, api=object())
 
 
+def test_self_terminate_live_branch_uses_stripped_key(monkeypatch):
+    # F-043 residual (delta review, 07-28): the api-is-None live branch set
+    # runpod.api_key from the RAW env value, discarding require_secret's strip -
+    # on the one call that stops billing. Pin the stripped value end to end.
+    import sys
+    import types
+    stub = types.ModuleType("runpod")
+    calls = {}
+    stub.terminate_pod = lambda pod_id: calls.setdefault("pod_id", pod_id)
+    monkeypatch.setitem(sys.modules, "runpod", stub)
+    self_terminate({"RUNPOD_POD_ID": "pod-abc", "RUNPOD_API_KEY": "k-live\n"},
+                   api=None)
+    assert calls["pod_id"] == "pod-abc"
+    assert stub.api_key == "k-live"
+
+
 def test_self_terminate_retries_transient_failure_then_succeeds():
     # The sole billing-stopping call must survive a transient API blip: fail twice,
     # succeed on the third attempt. Without the retry a single 5xx leaves the pod
@@ -165,3 +183,102 @@ def test_self_terminate_rejects_nonpositive_attempts():
     with pytest.raises(ValueError, match="attempts"):
         self_terminate({"RUNPOD_POD_ID": "pod-abc", "RUNPOD_API_KEY": "k"},
                        api=object(), attempts=0)
+
+
+# --- F-009 T9 (D8): fleet-mode pod-subset check ------------------------------------
+
+def test_parse_fleet_expected_unset_returns_none():
+    # UNSET means "run no check at all" - byte-identical to pre-D8 reality, where
+    # the "0 assay pods" rule lived only in the operator runbook, never in code.
+    assert parse_fleet_expected(None) is None
+
+
+def test_parse_fleet_expected_empty_string_means_expect_zero():
+    # SET but blank automates the runbook's original "0 assay pods" rule for the
+    # first time: an empty expected-set, so ANY running assay pod is a stray.
+    assert parse_fleet_expected("") == set()
+
+
+def test_parse_fleet_expected_parses_comma_separated_names():
+    assert parse_fleet_expected("assay-nvfp4-a, assay-nvfp4-b") == {
+        "assay-nvfp4-a", "assay-nvfp4-b"}
+
+
+def test_fleet_stray_warning_lines_empty_when_subset():
+    pods = [{"name": "assay-nvfp4-a"}]
+    assert fleet_stray_warning_lines({"assay-nvfp4-a", "assay-nvfp4-b"}, pods) == []
+
+
+def test_fleet_stray_warning_lines_names_the_stray():
+    pods = [{"name": "assay-nvfp4-a"}, {"name": "assay-leftover"}]
+    lines = fleet_stray_warning_lines({"assay-nvfp4-a"}, pods)
+    assert len(lines) == 1
+    assert "assay-leftover" in lines[0]
+    assert "WARN" in lines[0]
+
+
+def test_fleet_stray_warning_lines_expect_zero_warns_on_any_pod():
+    pods = [{"name": "assay-nvfp4"}]
+    lines = fleet_stray_warning_lines(set(), pods)
+    assert len(lines) == 1 and "assay-nvfp4" in lines[0]
+
+
+def test_fleet_stray_warning_lines_no_pods_is_silent():
+    assert fleet_stray_warning_lines(set(), []) == []
+    assert fleet_stray_warning_lines({"assay-nvfp4"}, None) == []
+
+
+# --- whole-branch review FIX 2: reader pods are not strays -----------------------
+
+def test_fleet_stray_warning_lines_exempts_reader_pods():
+    # Readers are default-on, launch-derived, TTL-backstopped, and their names embed
+    # an unknowable-in-advance pod id - they can NEVER be listed in
+    # ASSAY_FLEET_EXPECTED, so they must never be reported as strays.
+    pods = [{"name": "assay-nvfp4"}, {"name": f"{READER_NAME_PREFIX}xyz123"}]
+    lines = fleet_stray_warning_lines({"assay-nvfp4"}, pods)
+    assert lines == []
+
+
+def test_fleet_stray_warning_lines_still_warns_on_a_genuine_stray_alongside_a_reader():
+    pods = [{"name": f"{READER_NAME_PREFIX}xyz123"}, {"name": "assay-leftover"}]
+    lines = fleet_stray_warning_lines(set(), pods)
+    assert len(lines) == 1
+    assert "assay-leftover" in lines[0]
+
+
+def test_reader_name_prefix_matches_build_reader_payload_naming():
+    # Same source, no hand-copied second literal: the prefix the exemption checks
+    # against must be the exact one build_reader_payload uses to name a reader.
+    import base64
+    p = build_reader_payload(
+        main_pod_id="mainpod1", volume_id="vol1", dataset="org/run-artifacts",
+        loop_b64=base64.b64encode(b"loop").decode(),
+        snapshot_b64=base64.b64encode(b"snap").decode(),
+        env={"RUNPOD_API_KEY": "rk-test", "HF_TOKEN": "hf-test"})
+    assert p["name"].startswith(READER_NAME_PREFIX)
+
+
+def test_list_assay_pods_filters_to_assay_named_pods():
+    class FakeApi:
+        def get_pods(self):
+            return [{"name": "assay-nvfp4", "id": "p1"},
+                    {"name": "assay-reader-p1", "id": "p2"},
+                    {"name": "other-product-worker", "id": "p3"}]
+
+    pods = list_assay_pods({"RUNPOD_API_KEY": "k"}, api=FakeApi())
+    names = {p["name"] for p in pods}
+    assert names == {"assay-nvfp4", "assay-reader-p1"}
+
+
+def test_list_assay_pods_swallows_api_errors():
+    class Boom:
+        def get_pods(self):
+            raise RuntimeError("RunPod API down")
+
+    assert list_assay_pods({"RUNPOD_API_KEY": "k"}, api=Boom()) is None
+
+
+def test_list_assay_pods_without_key_returns_none():
+    # No api injected AND no RUNPOD_API_KEY: must degrade to None (warn-only), never
+    # raise or attempt a live call with no credential.
+    assert list_assay_pods({}, api=None) is None

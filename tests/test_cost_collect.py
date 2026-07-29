@@ -1,11 +1,15 @@
 import json
 import os
 
+import pytest
+
 from assay import runpod_ctl
 from assay.cost import collect
 from assay.cost.collect import (
     RECORD_NAME,
+    STALE_ZERO_UPTIME_SECONDS,
     _tmp_record_path,
+    balance_warning_line,
     effective_uptime_seconds,
     probe_gpu_price,
     probe_pod,
@@ -272,3 +276,128 @@ def test_probed_fields_exist_in_the_installed_sdk_query():
         assert field in query, (
             f"{field!r} is not in the installed runpod SDK's pod query - the cost "
             "probe would silently read None for it and every record would be $0.00")
+
+
+def test_zero_uptime_hours_after_begin_falls_through_to_accrual():
+    # The F-036 burn shape: RUNNING pod, provider runtime block transiently
+    # unpopulated (uptimeSeconds 0.0), began_at 7.1h ago -> accrual, not $0.
+    basis = {"uptime_seconds_at_begin": 120.0, "began_at_unix": 1000.0}
+    got = effective_uptime_seconds({"uptimeSeconds": 0.0}, basis,
+                                   now=1000.0 + 7.1 * 3600)
+    assert got == pytest.approx(120.0 + 7.1 * 3600)
+
+
+def test_zero_uptime_shortly_after_begin_is_trusted():
+    # A genuinely fresh pod can honestly read 0: inside the staleness window the
+    # provider value stands.
+    basis = {"uptime_seconds_at_begin": 0.0, "began_at_unix": 1000.0}
+    got = effective_uptime_seconds({"uptimeSeconds": 0.0}, basis,
+                                   now=1000.0 + STALE_ZERO_UPTIME_SECONDS - 1)
+    assert got == 0.0
+
+
+def test_nonzero_provider_uptime_still_wins():
+    basis = {"uptime_seconds_at_begin": 120.0, "began_at_unix": 1000.0}
+    assert effective_uptime_seconds({"uptimeSeconds": 42.0}, basis,
+                                    now=99999.0) == 42.0
+
+
+def test_zero_uptime_without_basis_stays_zero():
+    # No basis -> nothing to accrue from; behavior unchanged.
+    assert effective_uptime_seconds({"uptimeSeconds": 0.0}, None, now=5000.0) == 0.0
+
+
+class _FakeApi:
+    """Price-only fake: balance no longer comes through the api object at all
+    (get_user() omits clientBalance entirely, live-verified 2026-07-27) - balance
+    is injected separately via fetch_balance."""
+
+    def __init__(self, price):
+        self._p = price
+
+    def get_gpu(self, gpu_type_id, gpu_quantity=1):
+        return {"securePrice": self._p, "communityPrice": self._p * 0.7}
+
+
+def test_balance_warning_fires_when_short():
+    # $0.99/hr * 8h * 1.5 buffer = $11.88 > $9 balance -> warn, naming both numbers
+    line = balance_warning_line({}, api=_FakeApi(0.99), est_hours=8.0,
+                                fetch_balance=lambda: 9.0)
+    assert line is not None and "WARN" in line
+    assert "9.00" in line and "11.88" in line
+
+
+def test_balance_warning_silent_when_ample():
+    assert balance_warning_line({}, api=_FakeApi(0.99), est_hours=8.0,
+                                fetch_balance=lambda: 50.0) is None
+
+
+def test_balance_warning_never_raises_on_api_failure():
+    class _Boom:
+        def get_gpu(self, *a, **k):
+            raise RuntimeError("api down")
+    assert balance_warning_line({}, api=_Boom(), est_hours=8.0,
+                                fetch_balance=lambda: 9.0) is None
+
+
+def test_balance_warning_fetch_balance_failure_is_silent_not_raising():
+    # get_user() is NOT usable for balance: its query omits clientBalance entirely
+    # (live-verified 2026-07-27 - it returns only id/networkVolumes/pubKey), which
+    # is exactly why the fetch went through run_graphql_query instead. This pins
+    # the fallback for ANY fetch_balance failure (schema change, network blip): the
+    # pre-flight must degrade to silence, never raise into the launch path.
+    def _boom_balance():
+        raise TypeError("simulated schema change")
+    assert balance_warning_line({}, api=_FakeApi(0.99), est_hours=8.0,
+                                fetch_balance=_boom_balance) is None
+
+
+# --- F-009 T9 (D8): ASSAY_FLEET_EST_HOURS sums the whole batch's estimate ---------
+
+def test_balance_warning_fleet_est_hours_overrides_single_pod_estimate():
+    # 2-pod batch, 16h total: $0.99/hr * 16h * 1.5 buffer = $23.76 > $20 balance -> warn.
+    # est_hours=8.0 (the single-pod estimate) must be OVERRIDDEN by the fleet figure,
+    # not added to it or ignored.
+    line = balance_warning_line({"ASSAY_FLEET_EST_HOURS": "16"}, api=_FakeApi(0.99),
+                                est_hours=8.0, fetch_balance=lambda: 20.0)
+    assert line is not None and "WARN" in line
+    assert "23.76" in line
+    assert "11.88" not in line  # the single-pod figure must not leak into the message
+
+
+def test_balance_warning_fleet_est_hours_silent_when_ample():
+    assert balance_warning_line({"ASSAY_FLEET_EST_HOURS": "16"}, api=_FakeApi(0.99),
+                                est_hours=8.0, fetch_balance=lambda: 50.0) is None
+
+
+def test_balance_warning_fleet_est_hours_unset_keeps_single_pod_behavior():
+    # No ASSAY_FLEET_EST_HOURS in env -> byte-identical to the pre-D8 call.
+    line = balance_warning_line({}, api=_FakeApi(0.99), est_hours=8.0,
+                                fetch_balance=lambda: 9.0)
+    assert line is not None and "11.88" in line
+
+
+def test_balance_warning_fleet_est_hours_malformed_raises_loudly():
+    # Junior-admin-at-2AM rule: an operator config error must never silently fall
+    # back to the single-pod estimate - it must raise, naming the var and the value.
+    with pytest.raises(ValueError, match="ASSAY_FLEET_EST_HOURS"):
+        balance_warning_line({"ASSAY_FLEET_EST_HOURS": "not-a-number"},
+                             api=_FakeApi(0.99), est_hours=8.0,
+                             fetch_balance=lambda: 9.0)
+
+
+def test_balance_warning_fleet_est_hours_nonpositive_raises_loudly():
+    with pytest.raises(ValueError, match="ASSAY_FLEET_EST_HOURS"):
+        balance_warning_line({"ASSAY_FLEET_EST_HOURS": "0"}, api=_FakeApi(0.99),
+                             est_hours=8.0, fetch_balance=lambda: 9.0)
+
+
+def test_balance_warning_fleet_est_hours_non_finite_raises_loudly():
+    # whole-branch review FIX 4: float("inf") parses cleanly and is > 0, so
+    # without an isfinite check it slips past the "positive number" guard and
+    # corrupts the needed-balance arithmetic (price * inf * buffer). Same loud,
+    # actionable error as the other malformed-value cases, not a silent inf
+    # into the warning math.
+    with pytest.raises(ValueError, match="ASSAY_FLEET_EST_HOURS"):
+        balance_warning_line({"ASSAY_FLEET_EST_HOURS": "inf"}, api=_FakeApi(0.99),
+                             est_hours=8.0, fetch_balance=lambda: 9.0)

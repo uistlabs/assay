@@ -4,10 +4,15 @@ from assay import __version__
 from assay.config import load_config
 from assay.gate import evaluate_gate
 from assay.publish import build_model_card, publish_if_passed
+from tests.test_manifest import _sample_manifest
 
 
 ACC = ("gsm8k",)
 PPL = "wikitext"
+# Any valid manifest works for the pre-existing card tests below (they assert on
+# recipe/result-derived content, not manifest content) - one shared sample, never a
+# fresh ManifestV1(...) construction per call site (ManifestV1 is frozen).
+_M = _sample_manifest()
 
 
 def _res(passed: bool):
@@ -67,7 +72,7 @@ class FakeApi:
 
 def test_model_card_has_table_and_license():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "| task" in card
     assert "apache-2.0" in card.lower()
     assert "Qwen/Qwen2.5-7B-Instruct" in card
@@ -82,7 +87,7 @@ def test_model_card_names_the_pinned_base_revision():
                        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
     rev = cfg.recipe.base_revision
     assert rev  # live recipe is pinned; the card must surface it
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert rev[:12] in card
     assert f"https://huggingface.co/{cfg.recipe.base_model}/tree/{rev}" in card
 
@@ -94,7 +99,7 @@ def test_model_card_omits_revision_line_when_unpinned():
                        "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
     recipe = dataclasses.replace(cfg.recipe, base_revision="", base_files={})
     cfg = dataclasses.replace(cfg, recipe=recipe)
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "/tree/" not in card
     assert "@ ``" not in card
 
@@ -102,7 +107,7 @@ def test_model_card_omits_revision_line_when_unpinned():
 def test_card_has_citation_section():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16",
                        "ASSAY_PIPELINE_URL": "https://github.com/uist-labs/assay"})
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "## Citation" in card
     # BibTeX key + howpublished are derived from the repo, base cite from the recipe.
     assert "@misc{uist_labs_model_nvfp4a16," in card
@@ -114,14 +119,14 @@ def test_card_has_citation_section():
 
 def test_card_tags_come_from_recipe_not_string_surgery():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "nvfp4a16" in card
     assert "8-bit" not in card  # this is 4-bit weights; the wrong tag must be gone
 
 
 def test_card_has_generated_hardware_section():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "Hardware" in card
     assert "Marlin" in card and "sm_89" in card and "Turing" in card  # measured floor + Turing excluded
     assert "Blackwell" in card  # states it is NOT required
@@ -129,7 +134,7 @@ def test_card_has_generated_hardware_section():
 
 def test_card_hardware_section_requires_blackwell_for_activation_quant_scheme():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4", "ASSAY_QUANT_SCHEME": "NVFP4"})
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "Blackwell" in card
     assert "not require Blackwell" not in card
     assert "no Blackwell required" not in card
@@ -139,7 +144,7 @@ def test_card_hardware_section_requires_blackwell_for_activation_quant_scheme():
 
 def test_card_chat_methodology_does_not_overclaim_real_usage():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})  # default recipe = chat
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "reflect real usage" not in card.lower()  # overclaim for loglikelihood MC rows
     assert "read the deltas, not the absolute" in card  # honest framing
     assert "both sides are evaluated with identical settings" in card
@@ -147,20 +152,20 @@ def test_card_chat_methodology_does_not_overclaim_real_usage():
 
 def test_card_methodology_is_chat_mode_aware():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})  # qwen recipe, mode=chat
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "chat" in card.lower()
     assert "raw-completion" not in card.lower()  # the old caveat must be gone in chat mode
 
 
 def test_card_has_provenance_stamp():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert __version__ in card
 
 
 def test_card_is_ascii():
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    assert build_model_card(cfg, _res(True)).isascii()
+    assert build_model_card(cfg, _res(True), _M).isascii()
 
 
 def test_card_uses_single_hyphen_not_double():
@@ -177,9 +182,9 @@ def test_card_uses_single_hyphen_not_double():
     # this test broke during the 2026-07-24 sweep.
     needle = " " + ("-" * 2) + " "
     r1_cfg, r1_res = _r1_sig_res()
-    assert needle not in build_model_card(r1_cfg, r1_res)
+    assert needle not in build_model_card(r1_cfg, r1_res, _M)
     default_cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    assert needle not in build_model_card(default_cfg, _res(True))
+    assert needle not in build_model_card(default_cfg, _res(True), _M)
 
 
 def test_r1_card_renders_significance_cert_without_crash():
@@ -187,7 +192,7 @@ def test_r1_card_renders_significance_cert_without_crash():
     # must render the ACTIVE thresholds only (significance + ppl), never format a None.
     cfg = load_config({"ASSAY_RECIPE": "r1_distill_qwen_7b",
                        "ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/R1-NVFP4A16"})
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "None" not in card              # no NoneType formatted into the card
     # F-032: the headline criteria bullet must state the PAIRED basis; the deleted
     # unpaired construction ("of the baseline and quantized scores") is pinned OUT so
@@ -204,7 +209,7 @@ def test_publishes_when_gate_passes(tmp_path):
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
     api = FakeApi()
     published = publish_if_passed(cfg, str(tmp_path), _res(True), token="t", api=api,
-                                  dry_run=False)
+                                  dry_run=False, manifest=_M)
     assert published is True
     assert api.uploaded is True
 
@@ -213,7 +218,7 @@ def test_does_not_publish_when_gate_fails(tmp_path):
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
     api = FakeApi()
     published = publish_if_passed(cfg, str(tmp_path), _res(False), token="t", api=api,
-                                  dry_run=False)
+                                  dry_run=False, manifest=_M)
     assert published is False
     assert api.uploaded is False
 
@@ -224,7 +229,8 @@ def test_dry_run_writes_card_but_skips_upload(tmp_path):
     # never fire - a dry run is not a publish.
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
     api = FakeApi()
-    published = publish_if_passed(cfg, str(tmp_path), _res(True), token="t", api=api, dry_run=True)
+    published = publish_if_passed(cfg, str(tmp_path), _res(True), token="t", api=api, dry_run=True,
+                                  manifest=_M)
     assert published is False
     assert api.uploaded is False
     assert (tmp_path / "README.md").exists()  # card still built (exercises card gen)
@@ -234,7 +240,7 @@ def test_r1_card_is_battery_generic_and_significance_shaped():
     # #4: the noise caveat is battery-generic (no gsm8k - R1 has no gsm8k task), and a
     # significance-gated card leads with the verdict line, not the noise-mean headline.
     cfg, result = _r1_sig_res()
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     assert "gsm8k" not in card                                  # stale caveat gone
     assert "a finite benchmark set is a sample" in card         # battery-generic caveat
     assert "Gate: PASS" in card                                 # significance verdict via render
@@ -254,7 +260,7 @@ def test_r1_card_is_battery_generic_and_significance_shaped():
 
 def test_card_drops_the_false_binding_signal_claim():
     cfg, result = _r1_sig_res()
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     assert "binding, low-variance signal" not in card
     assert "power-limited" not in card
     # ...and does not deny that noise can fail a sound quant, which it can at k=2.
@@ -265,7 +271,7 @@ def test_card_states_per_task_fail_threshold_from_measured_stderr():
     # k * paired SE, in points, per scored task. aime24_avg: paired SE 0.12728,
     # k=2 -> 25.5 pts. minerva: paired SE 0.028284 -> 5.7 pts.
     cfg, result = _r1_sig_res()
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     assert "`aime24_avg` (avg@16, the mean of 16 samples per item) 25.5 pts" in card
     assert "`minerva_math500` 5.7 pts" in card
     assert "Per-task fail thresholds (this run)" in card
@@ -284,7 +290,7 @@ def test_card_discloses_the_paired_test_without_spinning_it():
     # sqrt-combination text is gone with the formula it described; the paired test is
     # stated as construction, not characterized as a virtue.
     cfg, result = _r1_sig_res()
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     assert "paired" in card
     assert "per-item score differences" in card
     assert "sqrt(se_baseline^2 + se_quantized^2)" not in card
@@ -300,7 +306,7 @@ def test_card_states_the_one_sided_upper_bound_per_task():
     # meaningful now that the SE is paired. aime: (0.01 + 2*0.1272792)*100 = 26.5
     # pts; minerva: (0.005 + 2*0.0282843)*100 = 6.2 pts.
     cfg, result = _r1_sig_res()
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     assert "upper confidence bound" in card
     assert "26.5" in card
     assert "6.2" in card
@@ -308,7 +314,7 @@ def test_card_states_the_one_sided_upper_bound_per_task():
 
 def test_card_states_false_alarm_rate_at_one_sig_fig_and_no_family_wise_number():
     cfg, result = _r1_sig_res()
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     # NOMINAL rate from a normal approximation over small-n metrics: one significant
     # figure, because 3 would imply a calibration we have not verified.
     assert "nominal false-alarm rate of about 2% per task" in card
@@ -324,7 +330,7 @@ def test_card_keeps_the_perplexity_backstop_as_an_independent_bar():
     # the certification reading hollow. Derived from the recipe (perplexity set +
     # max_ppl_increase), so no task taxonomy is needed to state it.
     cfg, result = _r1_sig_res()
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     assert "perplexity criterion is an independent hard bar" in card
     assert "no more than 3%" in card
 
@@ -335,13 +341,13 @@ def test_repeat_protocol_derives_from_recipe_and_never_guesses_single_draw():
     "single draw" is itself a guessed classification - the recipe cannot tell one sampled
     draw from a greedy or loglikelihood-scored task."""
     cfg, result = _r1_sig_res()
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     assert "single draw" not in card
     assert "deterministic" not in card.lower()
 
     ev = dataclasses.replace(cfg.recipe.eval, repeats={"minerva_math500": 4})
     swapped = build_model_card(
-        dataclasses.replace(cfg, recipe=dataclasses.replace(cfg.recipe, eval=ev)), result)
+        dataclasses.replace(cfg, recipe=dataclasses.replace(cfg.recipe, eval=ev)), result, _M)
     assert "`minerva_math500` (avg@4, the mean of 4 samples per item)" in swapped
     assert "`aime24_avg` 25.5 pts" in swapped   # no longer repeated -> no label
     assert "avg@16" not in swapped              # nothing remembers the old recipe
@@ -349,13 +355,13 @@ def test_repeat_protocol_derives_from_recipe_and_never_guesses_single_draw():
 
 def test_card_states_run_level_generation_settings_from_gen_kwargs():
     cfg, result = _r1_sig_res()   # R1 pins temperature 0.6 / top_p 0.95
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     assert "Run-level generation settings: temperature 0.6, top_p 0.95" in card
     assert "do_sample" not in card and "max_gen_toks" not in card  # not sampling settings
     # A recipe pinning nothing must say so, not invent settings.
     ev = dataclasses.replace(cfg.recipe.eval, gen_kwargs=None)
     bare = build_model_card(
-        dataclasses.replace(cfg, recipe=dataclasses.replace(cfg.recipe, eval=ev)), result)
+        dataclasses.replace(cfg, recipe=dataclasses.replace(cfg.recipe, eval=ev)), result, _M)
     assert "No run-level sampling overrides were set" in bare
 
 
@@ -365,9 +371,9 @@ def test_usage_snippet_sampling_comes_from_the_recipe():
     # did not use.
     cfg, result = _r1_sig_res()
     assert "SamplingParams(temperature=0.6, top_p=0.95, max_tokens=256)" in \
-        build_model_card(cfg, result)
+        build_model_card(cfg, result, _M)
     # Nothing pinned -> no invented recommendation, just the length cap.
-    qwen = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True))
+    qwen = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True), _M)
     assert "SamplingParams(max_tokens=256)" in qwen
     assert "temperature=0.7" not in qwen
 
@@ -385,7 +391,7 @@ def test_single_scored_task_card_does_not_name_it_twice():
     quant = {"minerva_math500": {"metric": "math_verify,none", "value": 0.835, "stderr": 0.02, "items": mq},
              "wikitext": {"metric": "word_perplexity", "value": 10.05}}
     result = evaluate_gate(base, quant, ("minerva_math500",), "wikitext", thresholds=gate)
-    card = build_model_card(cfg, result)
+    card = build_model_card(cfg, result, _M)
     assert card.count("`minerva_math500` 5.7 pts") == 1
     assert "power-limited" not in card
     assert card.isascii()
@@ -395,9 +401,9 @@ def test_card_drops_unsupported_regularization_claim():
     # "quantization acting as mild regularization" was an unsupported causal claim, and
     # the v0.4->v0.5 pair showed that positive delta flipped sign (i.e. it was noise).
     cfg, result = _r1_sig_res()
-    for card in (build_model_card(cfg, result),
+    for card in (build_model_card(cfg, result, _M),
                  build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}),
-                                  _res(True))):
+                                  _res(True), _M)):
         assert "regulariz" not in card.lower()
         assert "no measurable loss" in card
         # "small benchmark sets vary run to run" is false for a greedy/loglikelihood
@@ -407,9 +413,9 @@ def test_card_drops_unsupported_regularization_claim():
 
 def test_card_scopes_the_claim_to_the_delta_on_every_recipe():
     cfg, result = _r1_sig_res()
-    for card in (build_model_card(cfg, result),
+    for card in (build_model_card(cfg, result, _M),
                  build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}),
-                                  _res(True))):
+                                  _res(True), _M)):
         assert "the certified quantity is the delta" in card
         assert "same software stack" in card
         assert "stored baseline" in card   # the published twin of the cached-baseline rejection
@@ -419,10 +425,10 @@ def test_rerun_variance_claim_only_appears_when_the_recipe_samples():
     # On a greedy / loglikelihood battery a rerun on the same stack reproduces the score
     # exactly, so claiming run-to-run movement would invent noise. The stack-drift clause
     # is unconditional - wikitext (deterministic) moved 0.46% across v0.4.0 -> v0.5.0.
-    sig = build_model_card(*_r1_sig_res())
+    sig = build_model_card(*_r1_sig_res(), _M)
     assert "rerunning it on the same stack" in sig
     assert "up to roughly the standard errors shown" in sig   # a BOUND, not an equality
-    qwen = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True))
+    qwen = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True), _M)
     assert "rerunning it on the same stack" not in qwen
     assert "across harness or library versions" in qwen       # stack clause survives
 
@@ -432,9 +438,9 @@ def test_card_does_not_overclaim_what_the_certification_covers():
     # accuracy deltas on the listed benchmarks plus a perplexity ratio. It certifies
     # NOTHING about bias, safety, or behavior at large.
     cfg, result = _r1_sig_res()
-    for card in (build_model_card(cfg, result),
+    for card in (build_model_card(cfg, result, _M),
                  build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}),
-                                  _res(True))):
+                                  _res(True), _M)):
         assert "does not add or remove bias" not in card
         assert "faithfully reproduces the base model" not in card
         assert "certifies exactly that" not in card
@@ -446,7 +452,7 @@ def test_card_does_not_assert_unmeasured_w4a4_accuracy_behavior():
     # assay has never measured W4A4 accuracy; the one in-house datum is a perplexity
     # rejection. On a card closing with "actual measured numbers, not vendor estimates",
     # the comparison must be attributed and the real datum used.
-    card = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True))
+    card = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True), _M)
     assert "widely reported" in card and "we have not measured that ourselves" in card
     assert "failed the perplexity bar at +12.55%" in card
     assert "accept more degradation" not in card   # unmeasured comparative claim
@@ -458,11 +464,11 @@ def test_scheme_overview_bullets_track_the_actual_scheme():
     # single-task max()/min() bug.
     w4a4 = build_model_card(
         load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4", "ASSAY_QUANT_SCHEME": "NVFP4"}),
-        _res(True))
+        _res(True), _M)
     assert "quantizes **activations as well as weights**" in w4a4
     assert "(weight-only)." not in w4a4
     assert "Why weight-only" not in w4a4
-    wo = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True))
+    wo = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True), _M)
     assert "Why weight-only" in wo
 
 
@@ -470,17 +476,17 @@ def test_card_license_comes_from_the_recipe_not_a_hardcoded_constant():
     # A quantization is a derivative work. publish.py hardcoded "apache-2.0", which
     # misdeclared the R1 card: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B is MIT upstream
     # (verified against the Hub 2026-07-26).
-    r1 = build_model_card(*_r1_sig_res())
+    r1 = build_model_card(*_r1_sig_res(), _M)
     assert "license: mit" in r1
     assert "license: apache-2.0" not in r1
-    qwen = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True))
+    qwen = build_model_card(load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/M-NVFP4A16"}), _res(True), _M)
     assert "license: apache-2.0" in qwen   # correct for Qwen2.5-7B-Instruct
 
 
 def test_mode_note_does_not_hardcode_a_battery_shape():
     # "most visibly on the multiple-choice tasks" described tasks the R1 battery does
     # not contain - the exact class of hardcode the modularity rule bans.
-    card = build_model_card(*_r1_sig_res())
+    card = build_model_card(*_r1_sig_res(), _M)
     assert "multiple-choice" not in card
     assert "read the deltas, not the absolute values" in card
 
@@ -489,7 +495,7 @@ def test_point_gated_card_gets_no_significance_prose():
     # Qwen is point-gated (k_stderr None): its flag threshold IS max_single_drop_pts,
     # already stated in the certification criteria. No MDR block, no false-flag rate.
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "flags a task only when" not in card
     assert "by chance" not in card
     assert "No single accuracy task down more than" in card   # the real bar, unchanged
@@ -500,7 +506,7 @@ def test_qwen_card_unchanged_keeps_correct_gsm8k_caveat():
     # applies, but it must NOT get the significance-only power-note bullet (#3), and
     # its mean-retention headline (a real gate criterion here) is unchanged.
     cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
-    card = build_model_card(cfg, _res(True))
+    card = build_model_card(cfg, _res(True), _M)
     assert "gsm8k" in card                             # correct for Qwen (gsm8k IS its task)
     assert "power-limited" not in card                 # point gate: no significance power line
     assert "Mean accuracy retention:" in card
@@ -518,3 +524,138 @@ def test_dry_run_is_keyword_only_and_required():
     assert param.default is inspect.Parameter.empty, "dry_run must be required"
     assert param.kind is inspect.Parameter.KEYWORD_ONLY, \
         "dry_run must be keyword-only so it can never be supplied positionally by accident"
+
+
+def test_card_discloses_context_length_when_capped():
+    cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
+    card = build_model_card(dataclasses.replace(cfg, max_model_len=36864), _res(True), _M)
+    assert "max_model_len=36864" in card
+    assert "both eval sides" in card.lower()
+
+
+def test_card_silent_on_native_context():
+    cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
+    card = build_model_card(dataclasses.replace(cfg, max_model_len=None), _res(True), _M)
+    assert "max_model_len" not in card
+
+
+def test_card_discloses_context_length_on_significance_gate():
+    """Significance-gated (R1) recipe with max_model_len must disclose the context length
+    in addition to significance-specific prose."""
+    cfg, result = _r1_sig_res()
+    card = build_model_card(dataclasses.replace(cfg, max_model_len=36864), result, _M)
+    assert "max_model_len=36864" in card
+    assert "both eval sides" in card.lower()
+    # Regression guard: significance prose must still be present
+    assert "Per-task fail thresholds (this run)" in card
+
+
+def test_point_gated_context_none_has_no_generation_settings():
+    """Point-gated (Qwen) recipe with max_model_len=None must not include gen_note
+    from _statistical_notes (it stays empty for point gates unless context is capped).
+    This guards against regression where gen_note was incorrectly added to point gates."""
+    cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
+    card = build_model_card(dataclasses.replace(cfg, max_model_len=None), _res(True), _M)
+    # Point gates have NO generation settings or sampling override text from _statistical_notes
+    assert "Run-level generation settings" not in card
+    assert "No run-level sampling overrides" not in card
+
+
+# --- F-009 T8: manifest card section + manifest.json in the checkpoint-repo upload ----
+
+def test_stack_manifest_section_renders_headline_fields_and_pins():
+    # Golden-fragment test (spec Rendering): image digest line, the five load-bearing
+    # pins by name, and the VERBATIM non-ECC sentence for a not-applicable manifest
+    # (_sample_manifest's hardware has ecc_supported=False).
+    from assay.publish import _stack_manifest_section
+    section = _stack_manifest_section(_M)
+    assert _M.image in section
+    assert ("This measurement ran on hardware without memory-error protection "
+            "(no ECC).") in section
+    for pin in ("torch", "vllm", "llmcompressor", "compressed-tensors", "lm_eval"):
+        assert pin in section
+    # _sample_manifest's stack carries only torch - the other four load-bearing
+    # pins must render "not-pinned" rather than being dropped or crashing.
+    assert "not-pinned" in section
+    assert section.isascii()
+
+
+def test_stack_manifest_section_states_void_verdict_honestly(manifest_void):
+    # F-009 T6 leaves a forward note: an ECC-void run never reaches publish (the gate
+    # fails it), so in practice this only ever renders clean/not-applicable - but the
+    # section must not ASSUME that. A void manifest must state the verdict plainly,
+    # never the clean or not-applicable wording.
+    from assay.publish import _stack_manifest_section
+    section = _stack_manifest_section(manifest_void)
+    assert "void" in section.lower()
+    assert ("This measurement ran on hardware without memory-error protection "
+            "(no ECC).") not in section
+    assert section.isascii()
+
+
+def test_stack_manifest_section_states_not_captured_verdict_honestly(manifest_ecc_not_captured):
+    from assay.publish import _stack_manifest_section
+    section = _stack_manifest_section(manifest_ecc_not_captured)
+    assert "not-captured" in section.lower()
+    assert ("This measurement ran on hardware without memory-error protection "
+            "(no ECC).") not in section
+    assert section.isascii()
+
+
+def test_stack_manifest_section_resolves_lm_eval_hyphenated_stack_key():
+    # deploy/constraints.txt pins the real distribution name "lm-eval" (hyphen) -
+    # StackPin.name is literally that string. The section must still find and show
+    # the observed version under the "lm_eval" display label, not fall through to
+    # "not-pinned" for a package that IS pinned (a false-negative on the card).
+    from assay.manifest import StackPin
+    from assay.publish import _stack_manifest_section
+    m = dataclasses.replace(_M, stack=(StackPin(name="lm-eval", pinned="0.4.12",
+                                                 observed="0.4.12"),))
+    section = _stack_manifest_section(m)
+    assert "lm_eval" in section
+    assert "| lm_eval | 0.4.12 |" in section
+    assert "| lm_eval | not-pinned |" not in section
+
+
+def test_stack_manifest_section_states_clean_verdict_honestly(manifest_corrected_only):
+    # ECC-capable hardware, verdict=clean (corrected errors only - disclosed, not a
+    # gate failure). Must not read as the not-applicable (no-ECC) wording either.
+    from assay.publish import _stack_manifest_section
+    section = _stack_manifest_section(manifest_corrected_only)
+    assert "clean" in section.lower()
+    assert ("This measurement ran on hardware without memory-error protection "
+            "(no ECC).") not in section
+    assert section.isascii()
+
+
+def test_card_includes_the_stack_manifest_section():
+    cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
+    card = build_model_card(cfg, _res(True), _M)
+    assert _M.image in card
+    assert "llmcompressor" in card
+    assert card.isascii()
+
+
+def test_publish_writes_manifest_json_beside_the_card(tmp_path):
+    # Upload-set test (spec Rendering: "manifest.json added to the checkpoint-repo
+    # upload set"): manifest.json must land in the staged out_dir, round-trippable.
+    from assay.manifest import ManifestV1
+    cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
+    api = FakeApi()
+    published = publish_if_passed(cfg, str(tmp_path), _res(True), token="t", api=api,
+                                  dry_run=False, manifest=_M)
+    assert published is True
+    manifest_path = tmp_path / "manifest.json"
+    assert manifest_path.exists()
+    assert ManifestV1.from_json(manifest_path.read_text()) == _M
+
+
+def test_dry_run_still_stages_manifest_json(tmp_path):
+    # manifest.json is written "beside the card" - the dry-run path already builds
+    # the card without uploading, so it must build the manifest file too.
+    cfg = load_config({"ASSAY_WEIGHTS_PATH": "/vol/weights", "ASSAY_CHECKPOINT_REPO": "myorg/Model-NVFP4A16"})
+    api = FakeApi()
+    published = publish_if_passed(cfg, str(tmp_path), _res(True), token="t", api=api,
+                                  dry_run=True, manifest=_M)
+    assert published is False
+    assert (tmp_path / "manifest.json").exists()

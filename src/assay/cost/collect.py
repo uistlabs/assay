@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -36,6 +37,7 @@ from assay.runpod_ctl import REGION as _DEFAULT_REGION
 from assay.runpod_ctl import RTX_5090 as _DEFAULT_GPU_TYPE
 
 RECORD_NAME = "cost.json"
+STALE_ZERO_UPTIME_SECONDS = 600.0  # zero uptime > this seconds after begin is missing data
 
 
 def record_path(artifacts_dir: str) -> str:
@@ -198,7 +200,9 @@ def effective_uptime_seconds(pod: dict | None, basis: dict | None,
                              now: float | None = None) -> float:
     """Billed seconds for this pod: provider truth when available, else local accrual.
 
-    Provider truth wins because RunPod's uptimeSeconds is what it actually bills.
+    Provider truth wins because RunPod's uptimeSeconds is what it actually bills,
+    except a 0.0 read more than STALE_ZERO_UPTIME_SECONDS after begin, which is
+    treated as missing (F-036).
     When the pod can no longer be probed, accrue from the basis captured at begin:
     `uptime_seconds_at_begin + (now - began_at_unix)`. The basis offset is billed
     IMAGE-PULL time that the job never sees (uptime starts at pod creation, and a
@@ -208,9 +212,23 @@ def effective_uptime_seconds(pod: dict | None, basis: dict | None,
     """
     if pod and pod.get("uptimeSeconds") is not None:
         try:
-            return max(0.0, float(pod["uptimeSeconds"]))
+            uptime = max(0.0, float(pod["uptimeSeconds"]))
         except (TypeError, ValueError):
-            pass
+            uptime = None
+        if uptime is not None:
+            stale_zero = False
+            if uptime == 0.0 and basis and basis.get("began_at_unix") is not None:
+                stamp = time.time() if now is None else now
+                try:
+                    stale_zero = (float(stamp) - float(basis["began_at_unix"])
+                                  > STALE_ZERO_UPTIME_SECONDS)
+                except (TypeError, ValueError):
+                    stale_zero = False
+            if not stale_zero:
+                return uptime
+            # F-036: a RUNNING pod's runtime block is transiently unpopulated, so
+            # a 0.0 read hours after begin is MISSING data, not billing truth -
+            # the 7.1h burn recorded $0 this way. Fall through to local accrual.
     if not basis:
         return 0.0
     try:
@@ -413,6 +431,113 @@ def preflight_line(env, api=None) -> str:
             f"yet): a {_PREFLIGHT_REFERENCE_HOURS:.0f}h run would be about "
             f"${projected:.2f} + storage. Actual cost is recorded to cost.json in "
             "the artifacts dir.")
+
+
+_BALANCE_BUFFER = 1.5  # headroom multiplier: overruns + storage + the next run
+
+# Field name VERIFIED live 2026-07-27 (clientBalance, dollars) via GraphQL `myself`.
+# Access path MUST be run_graphql_query, NOT get_user() - get_user()'s query never
+# requests clientBalance at all (live-verified: it returns only
+# id/networkVolumes/pubKey), which would make the F-035 warning silently inert.
+# See _fetch_client_balance.
+_BALANCE_FIELD = "clientBalance"
+
+
+def _fetch_client_balance() -> "float | None":  # pragma: no cover - live SDK call
+    """Account balance in dollars via the SDK's GraphQL runner. get_user() is
+    NOT usable here: its query omits clientBalance entirely (live-verified
+    2026-07-27 - it returns only id/networkVolumes/pubKey), which would make
+    the F-035 warning silently inert."""
+    from runpod.api.graphql import run_graphql_query  # noqa: PLC0415
+    res = run_graphql_query("query { myself { %s } }" % _BALANCE_FIELD)
+    return float(res["data"]["myself"][_BALANCE_FIELD])
+
+
+def _resolve_fleet_est_hours(env, est_hours: float | None) -> float:
+    """ASSAY_FLEET_EST_HOURS (D8/F-009 T9, optional): the OPERATOR-SUPPLIED total
+    GPU-hours for the whole batch on the launch sheet (e.g. 2 pods x 8h = 16).
+    When set it OVERRIDES `est_hours` (the single-pod estimate) entirely, so a
+    fleet's balance warning compares clientBalance against the batch SUM, not
+    one pod's slice - F-035 warned per-launch; this is what makes it warn
+    per-fleet. Unset (or empty) -> `est_hours` (or the single-pod reference
+    hours) unchanged, byte-identical to pre-D8 behavior.
+
+    A malformed value is an OPERATOR CONFIG error, not a probe failure, so
+    UNLIKE the rest of this warn-only function it raises loudly (junior-admin-
+    at-2AM rule) naming the var and the bad value, instead of silently falling
+    back to the single-pod estimate - a silent fallback here would under-warn a
+    real fleet by up to Nx the single-pod figure. This does not conflict with
+    this module's header note ("nothing may raise into pod_entry.sh's control
+    flow"): that invariant scopes the IN-POD begin/finalize call chain;
+    balance_warning_line is called only from launch.sh on the operator's box,
+    pre-spend, already wrapped in a non-fatal `|| true` there.
+
+    PRISTINE NOTE: ASSAY_FLEET_EST_HOURS is deliberately absent from
+    config.py's `_RECIPE_OVERRIDES` / `_NONRECIPE_OVERRIDES` (the F-026
+    one-table rule that drives `_NONPRISTINE_VARS`). It gates an operator
+    spend-safety WARNING at launch time, never the recipe or the measured
+    environment, so it must never affect pristine - see the matching note on
+    `parse_fleet_expected` in runpod_ctl.py for the pod-check half."""
+    raw = env.get("ASSAY_FLEET_EST_HOURS")
+    if raw is None or raw == "":
+        return _PREFLIGHT_REFERENCE_HOURS if est_hours is None else est_hours
+    try:
+        parsed = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"ASSAY_FLEET_EST_HOURS must be a positive number, got: {raw!r}"
+        ) from None
+    # whole-branch review FIX 4: float("inf")/"nan" parse cleanly, and "inf" is
+    # > 0, so without this check a non-finite value slips past the guard below
+    # and corrupts `needed = price * est_hours * _BALANCE_BUFFER` (inf, or NaN
+    # which compares False to everything and silently defeats the warning).
+    if not math.isfinite(parsed) or not parsed > 0:
+        raise ValueError(
+            f"ASSAY_FLEET_EST_HOURS must be a positive number, got: {raw!r}")
+    return parsed
+
+
+def balance_warning_line(env, api=None, est_hours: float | None = None,
+                         fetch_balance=None) -> "str | None":
+    """WARN-ONLY credit pre-flight (F-035; Ken's posture 2026-07-27: never a
+    block). A mid-burn credit stop kills the pod with paid progress lost and no
+    guaranteed forensics upload (near-miss 07-27: $13 balance vs ~$9 run), so the
+    risk is surfaced BEFORE spend and the operator decides.
+
+    Returns a warning string when balance < rate * est_hours * _BALANCE_BUFFER,
+    else None. None also on ANY probe failure - an unreachable balance must never
+    gate a launch. Balance is read via `_fetch_client_balance` (GraphQL `myself`),
+    VERIFIED live 2026-07-27: runpod.get_user() is NOT usable for this - its query
+    omits clientBalance entirely. `fetch_balance` is injectable for tests; `api`
+    remains the seam for the price probe only.
+
+    ASSAY_FLEET_EST_HOURS (D8/F-009 T9) overrides `est_hours` with the whole
+    batch's operator-supplied GPU-hours when set - see `_resolve_fleet_est_hours`.
+    Resolved BEFORE the probe/fetch calls so a malformed value raises regardless
+    of network reachability (it is a config error, not a probe outcome).
+    """
+    est_hours = _resolve_fleet_est_hours(env, est_hours)
+    if api is None:  # pragma: no cover - real SDK only on the operator's box
+        api = _authenticated_runpod()
+        if api is None:
+            return None
+    gpu_type = env.get("ASSAY_GPU_TYPE", _DEFAULT_GPU_TYPE)
+    price = probe_gpu_price(gpu_type, _DEFAULT_CLOUD_TYPE, api=api)
+    if price is None:
+        return None
+    fetch_balance = _fetch_client_balance if fetch_balance is None else fetch_balance
+    try:
+        balance = float(fetch_balance())
+    except Exception:  # noqa: BLE001 - warn-only by design
+        return None
+    needed = price * est_hours * _BALANCE_BUFFER
+    if balance >= needed:
+        return None
+    return (f"[cost] WARN: account balance ${balance:.2f} is below "
+            f"${needed:.2f} (= ${price:.2f}/hr x {est_hours:.0f}h x "
+            f"{_BALANCE_BUFFER}x buffer). A mid-burn credit stop kills the pod "
+            "and can lose the forensics upload. WARN-ONLY - launch proceeds; "
+            "top up first if this run must finish.")
 
 
 def main(argv, env=None, api=None, now=None) -> int:

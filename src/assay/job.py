@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
@@ -10,6 +11,7 @@ from assay import __version__
 from assay.config import RunConfig, TIER_PROFILES, require_secret
 from assay.gate import GateResult, render_delta_table
 from assay.heartbeat import Heartbeat
+from assay.manifest import ManifestV1
 
 # The run-completion markers main() prints as its FINAL act. pod_entry.sh greps the
 # ephemeral log for one of these to prove the job actually ran work (a marker-less
@@ -27,7 +29,7 @@ class Deps(NamedTuple):
     run_eval: Callable
     parse: Callable
     gate: Callable
-    publish: Callable
+    publish: Callable  # (runcfg, out, result, hb, manifest) - F-009 T5
 
 
 def run_identity_lines(runcfg, env) -> list[str]:
@@ -72,12 +74,15 @@ def default_deps(env) -> Deps:  # pragma: no cover - wires real GPU/network deps
         parse=evaluate.parse_results,
         gate=None,  # bound in run_job (needs config tasks)
         # publish_if_passed needs the HF token as its 4th positional arg;
-        # run_job calls deps.publish(runcfg, out_dir, result, hb) - 4 args, no
-        # token - so bind the token from env here rather than wiring the
-        # bare function directly.
-        publish=lambda runcfg, out, result, hb: publish_mod.publish_if_passed(
+        # run_job calls deps.publish(runcfg, out_dir, result, hb, manifest) - 5
+        # args, no token - so bind the token from env here rather than wiring the
+        # bare function directly. manifest (F-009 T5 capture, T8 wiring) forwards
+        # straight through as publish_if_passed's keyword-only manifest arg, which
+        # feeds the card's measurement-environment section and manifest.json in the
+        # checkpoint-repo upload set.
+        publish=lambda runcfg, out, result, hb, manifest: publish_mod.publish_if_passed(
             runcfg, out, result, require_secret(env, "HF_TOKEN"), hb,
-            dry_run=not runcfg.pristine
+            dry_run=not runcfg.pristine, manifest=manifest
         ),
     )
 
@@ -114,6 +119,32 @@ def _write_artifact(path: str, render: Callable[[], str], hb: "Heartbeat | None"
             hb.emit("artifact", f"write failed: {exc}")
 
 
+def apply_ecc_policy(result: GateResult, manifest: ManifestV1) -> GateResult:
+    """ECC gate-void override (F-009, Ken ruling D3). An uncorrected ECC error
+    inside the measurement window invalidates the accuracy/perplexity numbers
+    regardless of what the gate itself computed - the run cannot prove what
+    caused the delta. Void condition VERBATIM from spec D3: an explicit "void"
+    verdict, OR ECC-capable hardware whose window verdict came back
+    "not-captured" (D9's reset-window rule extended to the gate - silence on
+    ECC-capable hardware is never read as clean). "not-applicable" (no ECC on
+    this hardware) and a "clean" verdict with only corrected errors both pass
+    through UNCHANGED (the identical object) - corrected-only is disclosed in
+    the manifest/card, never a gate failure.
+
+    Reuses the existing failed-gate plumbing (GateResult.passed=False) rather
+    than adding new state, so a void reaches publish exactly like any other
+    gate failure."""
+    ew = manifest.ecc_window
+    void = ew.verdict == "void" or (manifest.hardware.ecc_supported and ew.verdict == "not-captured")
+    if not void:
+        return result
+    detail = f"verdict={ew.verdict}"
+    if ew.uncorrected_delta is not None:
+        detail += f" uncorrected_delta={ew.uncorrected_delta}"
+    msg = f"ECC window void ({detail}) - measurement window integrity not certifiable"
+    return dataclasses.replace(result, passed=False, reasons=result.reasons + (msg,))
+
+
 def run_job(runcfg: RunConfig, env, deps: Deps) -> GateResult:
     """Orchestrate quantize -> eval(baseline+nvfp4) -> gate -> publish, always tearing
     the pod down in a finally. Control-flow only; stages are injected via `deps`.
@@ -124,10 +155,23 @@ def run_job(runcfg: RunConfig, env, deps: Deps) -> GateResult:
     disk (I1), and the heartbeat/eval/delta files never ride along into the public
     HF repo (I2) because artifacts_dir sits outside output_dir entirely."""
     from assay.gate import evaluate_gate
+    from assay.manifest import begin_capture, finalize
     from assay.watchdog import build_eval_watchdog
     raw_log_path = env.get("ASSAY_RAW_LOG")
+    # Default is the in-image path (WORKDIR /app, deploy/constraints.txt copied
+    # alongside it); the override exists solely so a rehearsal/test can point at a
+    # tmp constraints file instead of the real one, which the dev box legitimately
+    # cannot fully satisfy (image-only cu129 pins are not installed there).
+    constraints_path = env.get("ASSAY_CONSTRAINTS_PATH", "deploy/constraints.txt")
     def _wd_factory(child_pid, heartbeat):
-        return build_eval_watchdog(child_pid, raw_log_path, heartbeat, env)
+        # F-009 T7 (D6): arm the mid-run ECC fail-fast only when the begin-capture's
+        # hardware actually supports ECC - non-ECC hardware (the 5090) has nothing
+        # to poll, so passing None here keeps build_eval_watchdog's fatal_check
+        # disarmed exactly like ECC-absent hosts already are at the end-of-window
+        # verdict (build_ecc_window's "not-applicable" path).
+        ecc_begin = begin.counters_begin if begin.hardware.ecc_supported else None
+        return build_eval_watchdog(child_pid, raw_log_path, heartbeat, env,
+                                   ecc_begin=ecc_begin)
 
     recipe = runcfg.recipe
     all_task_names = list(recipe.accuracy_task_names) + (
@@ -150,6 +194,7 @@ def run_job(runcfg: RunConfig, env, deps: Deps) -> GateResult:
         include_path=assay_task_dir(),
         repeats=ev.repeats,
         capture_per_item=significance,
+        max_model_len=runcfg.max_model_len,
     )
     # Tier-driven eval-weakening (TIER_PROFILES, single source): cert leaves the
     # certified methodology untouched (every profile field None); dev/smoke cap
@@ -176,6 +221,10 @@ def run_job(runcfg: RunConfig, env, deps: Deps) -> GateResult:
         hb = Heartbeat(runcfg.heartbeat_path,
                        secrets=[env.get("HF_TOKEN", ""), env.get("RUNPOD_API_KEY", "")])
         hb.emit("start", recipe.base_model)
+        # F-009 T5: begin-capture is pre-GPU (before quantize's model load) - stack
+        # cross-assert + hardware/ECC baseline, so an unidentifiable image or a
+        # drifted stack dies here rather than after paid GPU-seconds.
+        begin = begin_capture(env, runcfg.gpu_mem_util, constraints_path=constraints_path)
         nvfp4_dir = deps.quantize(recipe, runcfg.weights_path, runcfg.output_dir, hb)
 
         base_raw = deps.run_eval(
@@ -211,13 +260,30 @@ def run_job(runcfg: RunConfig, env, deps: Deps) -> GateResult:
         gate_fn = deps.gate or (lambda b, q, a, p, t: evaluate_gate(b, q, a, p, t))
         result = gate_fn(base, quant, recipe.accuracy_task_names,
                          recipe.perplexity_task_name, recipe.gate_or_default)
+
+        # Finalize AFTER the gate result exists (capture point 3, spec): re-reads
+        # the ECC counters and stamps end_utc. The manifest.json copy rides the
+        # existing artifacts trail (I1/I2 pattern) - artifacts_dir, never
+        # output_dir (Task 8 owns the separate checkpoint-repo copy).
+        manifest = finalize(begin)
+        _write_artifact(
+            os.path.join(runcfg.artifacts_dir, "manifest.json"), manifest.to_json, hb,
+        )
+
+        # ECC gate-void override (F-009 T6, Ken ruling D3): must run AFTER finalize
+        # (needs the real ecc_window) and BEFORE every downstream consumer of
+        # `result` - the heartbeat marker, the persisted delta table, and publish
+        # all have to see the overridden GateResult, or a void would reach the
+        # published checkpoint dressed as a pass. No new state: a void is just an
+        # ordinary failed gate from here down.
+        result = apply_ecc_policy(result, manifest)
         hb.emit("gate", "PASSED" if result.passed else "FAILED")
         _write_artifact(
             os.path.join(runcfg.artifacts_dir, "delta-table.md"),
             lambda: render_delta_table(result, recipe.gate_or_default), hb,
         )
 
-        deps.publish(runcfg, nvfp4_dir, result, hb)
+        deps.publish(runcfg, nvfp4_dir, result, hb, manifest)
         return result
     except BaseException as exc:
         # Durable forensics. A rented, self-terminating pod can fail exactly once and
@@ -293,6 +359,10 @@ def main() -> None:  # pragma: no cover - pod entrypoint
     # pass before the GPU preflight; the minutes-long shard pass (pristine runs only)
     # after it, so a dead GPU fails first.
     verify.verify_weights_small(cfg, os.environ)
+    # KV sizing: clamp AFTER small-file verification (config.json is then
+    # identity-verified on pristine runs), BEFORE any GPU work.
+    from assay.config import clamp_max_model_len
+    cfg = clamp_max_model_len(cfg)
     assert_gpu_available()
     verify.verify_weights_shards(cfg, os.environ)
     deps = default_deps(os.environ)

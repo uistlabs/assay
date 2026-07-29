@@ -51,6 +51,20 @@ ALLOWED_CUDA_VERSIONS = ["12.9", "13.0"]
 # slim/split is the complementary image-side lever (bottleneck could be either end).
 MIN_DOWNLOAD_MBPS = 300
 
+# Reader-pod (F-040) defaults. The image is digest-pinned for the same reason the
+# launcher rejects a bare-tag ASSAY_IMAGE (a mutable tag served stale burned a run);
+# python:3.12-slim is the CPU-pod image the 07-27 post-mortem reader proved.
+READER_IMAGE = ("docker.io/library/python:3.12-slim"
+                "@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de")
+READER_VCPU = 2
+READER_DISK_GB = 10
+
+# Reader pods are named "{READER_NAME_PREFIX}{main_pod_id}" (build_reader_payload
+# below) - hoisted to a module constant (whole-branch review FIX 2) so
+# fleet_stray_warning_lines exempts readers from the same source that names them,
+# never a hand-copied second literal.
+READER_NAME_PREFIX = "assay-reader-"
+
 
 def build_pod_payload(*, image: str, volume_id: str, env_keys: list[str],
                       env: Mapping[str, str],
@@ -61,7 +75,12 @@ def build_pod_payload(*, image: str, volume_id: str, env_keys: list[str],
     extra_env (I3) carries non-secret ASSAY_* config overrides from the
     operator's shell straight through to the pod - appended as-is, no
     require_secret check and no redaction, so a reduced-battery smoke run
-    (e.g. ASSAY_NUM_CALIB=8) doesn't need an image rebuild."""
+    (e.g. ASSAY_NUM_CALIB=8) doesn't need an image rebuild.
+
+    NOTE env shape: this is the GraphQL surface, so `env` below is a LIST of
+    {key, value} dicts. build_reader_payload's `env` is the REST surface's flat
+    dict instead - the two are intentionally different wire shapes and must not
+    be unified into one helper."""
     gpu_type = env.get("ASSAY_GPU_TYPE", RTX_5090)
     region = env.get("ASSAY_REGION", REGION)
     resolved = [{"key": k, "value": require_secret(env, k)} for k in env_keys]
@@ -79,6 +98,75 @@ def build_pod_payload(*, image: str, volume_id: str, env_keys: list[str],
         "allowedCudaVersions": ALLOWED_CUDA_VERSIONS,
         "minDownload": MIN_DOWNLOAD_MBPS,
         "env": resolved,
+    }
+
+
+def _validated_positive_number(name: str, value: str) -> str:
+    """Validate a numeric env override before it reaches the pod (whole-branch review
+    finding): an unparseable or non-positive ASSAY_READER_TTL silently voids the TTL
+    backstop, and the same for ASSAY_READER_INTERVAL storms HF's commit rate limit
+    instead. Raise naming the var and the bad value - launch.sh's warn-guard turns
+    that into a loud, $0 skip of the reader rather than a reader that launches broken."""
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive number, got: {value!r}") from None
+    if not parsed > 0:
+        raise ValueError(f"{name} must be a positive number, got: {value!r}")
+    return value
+
+
+def build_reader_payload(*, main_pod_id: str, volume_id: str, dataset: str,
+                         loop_b64: str, snapshot_b64: str,
+                         env: Mapping[str, str]) -> dict:
+    """REST POST /v1/pods body for the F-040 reader pod (CPU: computeType + vcpuCount
+    REPLACE the gpu fields - the shape that worked first try 2026-07-27). The loop and
+    cycle scripts ride base64-embedded in dockerStartCmd so the pod needs no image
+    build and no network fetch of our code. Secrets are pulled at call time like
+    build_pod_payload; the reader carries the SAME per-session key the main pod does
+    (poll + self-terminate), never the management key.
+
+    NOTE env shape: `env` below is a flat {key: value} dict, the REST surface's
+    shape - build_pod_payload's GraphQL surface uses a LIST of {key, value} dicts
+    instead. Intentionally different wire shapes; do not unify."""
+    image = env.get("ASSAY_READER_IMAGE", READER_IMAGE)
+    if "@sha256:" not in image:
+        raise ValueError(f"reader image must be digest-pinned, got: {image}")
+    interval = _validated_positive_number(
+        "ASSAY_READER_INTERVAL", env.get("ASSAY_READER_INTERVAL", "600"))
+    ttl = _validated_positive_number(
+        "ASSAY_READER_TTL", env.get("ASSAY_READER_TTL", "86400"))
+    boot_escalate_min = _validated_positive_number(
+        "ASSAY_READER_BOOT_ESCALATE_MIN",
+        env.get("ASSAY_READER_BOOT_ESCALATE_MIN", "30"))
+    bootstrap = (
+        "mkdir -p /tmp/reader"
+        f" && echo {loop_b64} | base64 -d > /tmp/reader/reader_loop.sh"
+        f" && echo {snapshot_b64} | base64 -d > /tmp/reader/reader_snapshot.py"
+        " && bash /tmp/reader/reader_loop.sh"
+    )
+    return {
+        "name": f"{READER_NAME_PREFIX}{main_pod_id}",
+        "computeType": "CPU",
+        "vcpuCount": READER_VCPU,
+        "imageName": image,
+        "containerDiskInGb": READER_DISK_GB,
+        "cloudType": CLOUD_TYPE,
+        "dataCenterIds": [env.get("ASSAY_REGION", REGION)],
+        "networkVolumeId": volume_id,
+        "volumeMountPath": "/runpod-volume",
+        "dockerStartCmd": ["bash", "-lc", bootstrap],
+        "env": {
+            "RUNPOD_API_KEY": require_secret(env, "RUNPOD_API_KEY"),
+            "HF_TOKEN": require_secret(env, "HF_TOKEN"),
+            "ASSAY_READER_MAIN_POD_ID": main_pod_id,
+            "ASSAY_ARTIFACTS_DATASET": dataset,
+            "ASSAY_ARTIFACTS_DIR": env.get(
+                "ASSAY_ARTIFACTS_DIR", "/runpod-volume/assay-out/artifacts"),
+            "ASSAY_READER_INTERVAL": interval,
+            "ASSAY_READER_TTL": ttl,
+            "ASSAY_READER_BOOT_ESCALATE_MIN": boot_escalate_min,
+        },
     }
 
 
@@ -106,10 +194,10 @@ def self_terminate(env: Mapping[str, str], api=None, *,
         # Guard the empty-loop case: without this the tail `raise last_exc` would
         # `raise None` (TypeError), masking the real "termination failed" signal.
         raise ValueError(f"self_terminate: attempts must be >= 1, got {attempts}")
-    require_secret(env, "RUNPOD_API_KEY")  # presence check; value used to build api
-    if api is None:  # pragma: no cover - exercised only on the live pod
+    key = require_secret(env, "RUNPOD_API_KEY")  # also strips (F-043) - keep the
+    if api is None:                              # stripped value on the live branch
         import runpod
-        runpod.api_key = env["RUNPOD_API_KEY"]
+        runpod.api_key = key
         api = runpod
     last_exc: Exception | None = None
     for attempt in range(attempts):
@@ -122,3 +210,93 @@ def self_terminate(env: Mapping[str, str], api=None, *,
                 sleep(backoff_s)
     # Exhausted every attempt: re-raise so pod_entry.sh logs it (the `|| echo` path).
     raise last_exc
+
+
+# --- Fleet-mode pre-launch pod check (D8/F-009 T9) ---------------------------------
+#
+# Ken's ruling (2026-07-28): pod listing is pod-control domain, so this lives here,
+# not in preflight.py (which is deliberately NO-NETWORK - see its module docstring;
+# the plan that dispatched this task assumed preflight.py already held a "0 assay
+# pods" check to extend, but that check never existed as code - it was a MANUAL
+# runbook step, `runpod.get_pods()` run by hand before every launch. This is the
+# first time it is automated, built fleet-aware from the start per D8).
+
+
+def list_assay_pods(env: Mapping[str, str], api=None) -> list[dict] | None:
+    """Read-only `api.get_pods()` listing, filtered to pods assay itself created:
+    main launch pods (named "assay-nvfp4") and F-040 reader pods (named
+    "assay-reader-<id>"). The name-prefix filter matters because this RunPod
+    account is shared with other UIST products' pods - without it, an
+    unrelated product's pod would register as a false-positive stray.
+
+    `api` is injectable, matching `self_terminate`'s seam; `env` supplies
+    RUNPOD_API_KEY the same way. Bounded, read-only, warn-only (D8, same F-035
+    posture as `balance_warning_line`): returns None on ANY failure - missing
+    key, API error, malformed response - rather than raising. A pod list that
+    cannot be fetched must never block or crash a launch. Callers must treat
+    None as "nothing to check", never as "zero pods confirmed"."""
+    if api is None:  # pragma: no cover - real SDK only on the operator's box
+        key = env.get("RUNPOD_API_KEY", "")
+        if not key:
+            return None
+        import runpod
+        runpod.api_key = key
+        api = runpod
+    try:
+        pods = api.get_pods()
+    except Exception:  # noqa: BLE001 - warn-only by design
+        return None
+    if pods is None:
+        return None
+    return [p for p in pods if str(p.get("name", "")).startswith("assay")]
+
+
+def parse_fleet_expected(raw: "str | None") -> "set[str] | None":
+    """Parse ASSAY_FLEET_EXPECTED (D8/F-009 T9). Three states, matching Ken's
+    ruling exactly - documented here at the consumption site:
+
+    - `raw is None` (var UNSET): returns None, meaning the caller must run NO
+      check at all. Preserves byte-identical current behavior - the "0 assay
+      pods" rule was never automated (manual runbook only), so an operator who
+      has not opted into fleet mode sees no change.
+    - `raw == ""` (var SET but blank): returns an EMPTY set - "expect ZERO
+      assay pods", automating the runbook's original rule for the first time.
+      Any running assay pod warns.
+    - `raw` a non-empty comma-separated string: returns the parsed name set -
+      running assay pods must be a SUBSET of it; anything else is a stray.
+
+    PRISTINE NOTE: ASSAY_FLEET_EXPECTED is deliberately absent from
+    config.py's `_RECIPE_OVERRIDES` / `_NONRECIPE_OVERRIDES` (the F-026
+    one-table rule driving `_NONPRISTINE_VARS`). It gates an operator
+    pod-inventory safety WARNING at launch time, never the recipe or the
+    measured environment, so it must never affect pristine - see the matching
+    note on `_resolve_fleet_est_hours` in cost/collect.py for the balance half.
+    """
+    if raw is None:
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def fleet_stray_warning_lines(expected_names, pods) -> list[str]:
+    """Pure warn-only fleet-membership check (D8/F-009 T9): one line per
+    running assay pod whose name is NOT in `expected_names`. Never raises,
+    never blocks - the F-035 philosophy applied to pod inventory: strays are
+    surfaced, the operator decides. `pods` is the already-fetched,
+    already-filtered list from `list_assay_pods` (a plain argument rather than
+    a live call, so this half stays pure and trivially testable without the
+    SDK).
+
+    Reader pods (READER_NAME_PREFIX, whole-branch review FIX 2) are exempt from
+    this check by construction: they are default-on, launch-derived, TTL-
+    backstopped (ASSAY_READER_TTL self-terminates them regardless), and their
+    names embed the main pod's id, which is unknowable in advance - they can
+    never be listed in ASSAY_FLEET_EXPECTED, so treating them as strays would
+    warn on every single launch."""
+    expected = set(expected_names)
+    return [
+        f"[fleet] WARN: stray pod running: {p.get('name') or p.get('id', '?')} "
+        "(not in ASSAY_FLEET_EXPECTED) - operator decides, launch proceeds."
+        for p in (pods or [])
+        if p.get("name") not in expected
+        and not str(p.get("name", "")).startswith(READER_NAME_PREFIX)
+    ]

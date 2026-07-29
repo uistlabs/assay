@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from collections.abc import Callable, Mapping
@@ -76,9 +77,16 @@ _RECIPE_OVERRIDES: "dict[str, tuple[str, str, Callable[[str], object]]]" = {
 }
 
 # Overrides consumed OUTSIDE _apply_recipe_overrides, so they cannot be derived from the
-# table: the eval-budget knob (_resolve_eval_limit) and the test-only stall injection
-# (read in evaluate.py). These two are the only remaining hand-maintained entries.
-_NONRECIPE_OVERRIDES = ("ASSAY_LIMIT", "ASSAY_INJECT_STALL_AFTER")
+# table: the eval-budget knob (_resolve_eval_limit), the test-only stall injection
+# (read in evaluate.py), the KV-sizing candidate override (derive_max_model_len), the
+# eval engine's memory-geometry knob (gpu_mem_util, read directly in load_config), and
+# the manifest-capture pin-assert override (constraints_path, read directly in
+# run_job - redirects the runtime stack cross-assert to an arbitrary file, so it MUST
+# break pristine or an overridden run mints a real certificate; F-026 defect family).
+# These are the only remaining hand-maintained entries.
+_NONRECIPE_OVERRIDES = ("ASSAY_LIMIT", "ASSAY_INJECT_STALL_AFTER",
+                        "ASSAY_MAX_MODEL_LEN", "ASSAY_GPU_MEM_UTIL",
+                        "ASSAY_CONSTRAINTS_PATH")
 
 # Vars whose PRESENCE means the run diverged from the pristine git recipe, so a real
 # (non-dry-run) publish is refused.
@@ -160,6 +168,11 @@ class RunConfig:
     # Effective eval limit (docs/task) after tier + ASSAY_LIMIT. None = full battery.
     # Never 1 (refused at load).
     eval_limit: int | None = None
+    # KV sizing (max_model_len) passed to BOTH eval engines, or None for native
+    # context. load_config stores the recipe-derived CANDIDATE; job.main() clamps
+    # it against the weights' config.json (clamp_max_model_len) before use.
+    # Symmetry rule: derived from the recipe only - never per-side.
+    max_model_len: int | None = None
 
 
 def _is_within(child: str, parent: str) -> bool:
@@ -188,6 +201,94 @@ def _apply_recipe_overrides(recipe: Recipe, env: Mapping[str, str]) -> Recipe:
     if recipe_changes:
         recipe = replace(recipe, **recipe_changes)
     return recipe
+
+
+# Prompt headroom above max_gen_toks when deriving max_model_len. Battery prompts
+# are a few hundred tokens; lm-eval LEFT-TRUNCATES a prompt silently only when it
+# exceeds max_model_len - max_gen_toks, so a generous margin is the guard against
+# that silent-eval-change path. Costs ~3% of the concurrency win vs a 1024 margin.
+PROMPT_HEADROOM = 4096
+
+
+def derive_max_model_len(recipe: Recipe, env: Mapping[str, str]) -> int | None:
+    """KV-sizing candidate: the context the eval engine actually needs (spec
+    2026-07-27-assay-kv-sizing-design). Pure function of the RECIPE - never of
+    precision, weights, or eval side (the symmetry rule; both sides always get
+    the identical value). Generative recipes (gen_kwargs carries max_gen_toks)
+    derive max_gen_toks + PROMPT_HEADROOM; MC/loglikelihood recipes return None
+    (native context - prefill-bound batteries measurably gain nothing from a
+    cap). Task 2 clamps the candidate to the weights' native context in-pod.
+
+    ASSAY_MAX_MODEL_LEN replaces the candidate (non-pristine via
+    _NONRECIPE_OVERRIDES). Dev/smoke tiers cap max_gen_toks downstream in
+    run_job but derivation stays on the recipe value - a dev run merely
+    over-reserves, harmlessly."""
+    gk = recipe.eval.gen_kwargs or {}
+    mgt = gk.get("max_gen_toks")
+    raw = env.get("ASSAY_MAX_MODEL_LEN", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(
+                f"ASSAY_MAX_MODEL_LEN={raw!r} must be an integer (a token count); "
+                "unset it for the recipe-derived value") from None
+        if value <= 0:
+            raise ValueError(
+                "ASSAY_MAX_MODEL_LEN must be positive; unset it entirely for "
+                "native/derived context, do not pass 0")
+        if mgt and value <= int(mgt):
+            raise ValueError(
+                f"ASSAY_MAX_MODEL_LEN={value} <= the recipe's max_gen_toks "
+                f"({mgt}): generation would be silently truncated, changing the "
+                "eval; use a larger value or unset it")
+        return value
+    if mgt:
+        return int(mgt) + PROMPT_HEADROOM
+    return None
+
+
+def _read_weights_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def clamp_max_model_len(cfg: RunConfig, reader=None) -> RunConfig:
+    """Clamp the derived candidate to the weights' NATIVE context, read from the
+    resolved weights directory's config.json - offline, in-pod. Call ordering
+    matters: job.main() runs this AFTER verify_weights_small, so on pristine runs
+    the file this reads is already identity-verified (F-015 pinned set).
+
+    candidate >= native -> None: never raise above native, never pass a redundant
+    cap. Unreadable/keyless config.json -> keep the candidate and WARN: a too-high
+    candidate fails loudly at vLLM startup, while dropping the cap here would
+    silently change measurement geometry. Prints its decision either way - the
+    operator-visible record of the run's KV geometry."""
+    if cfg.max_model_len is None:
+        return cfg
+    read = reader or (lambda p: _read_weights_config(p))
+    cfg_path = os.path.join(cfg.weights_path, "config.json")
+    native = None
+    try:
+        native = read(cfg_path).get("max_position_embeddings")
+        native = int(native) if native is not None else None
+    except Exception as exc:  # noqa: BLE001 - warn-and-continue is the design
+        print(f"assay.config: could not read {cfg_path} to clamp max_model_len "
+              f"({exc}); keeping candidate {cfg.max_model_len} - if it exceeds "
+              "the model's native context, vLLM will refuse it at startup",
+              file=sys.stderr)
+        return cfg
+    if native is None:
+        print(f"assay.config: {cfg_path} has no max_position_embeddings; keeping "
+              f"max_model_len candidate {cfg.max_model_len}", file=sys.stderr)
+        return cfg
+    if cfg.max_model_len >= native:
+        print(f"assay.config: max_model_len candidate {cfg.max_model_len} >= "
+              f"native context {native} - using native (no cap passed)")
+        return replace(cfg, max_model_len=None)
+    print(f"assay.config: max_model_len={cfg.max_model_len} "
+          f"(native {native}; recipe-derived KV sizing)")
+    return cfg
 
 
 def _resolve_tier(env: Mapping[str, str]) -> str:
@@ -296,7 +397,7 @@ def load_config(env: Mapping[str, str]) -> RunConfig:
         print("assay.config: ASSAY_PIPELINE_URL unset on a live cert run - the "
               "published model card will name the pipeline with no pipeline link. "
               "Set it to the TAG-PINNED repo URL, e.g. "
-              "https://github.com/uist-labs/assay/tree/v0.6.1 - a card is a frozen "
+              "https://github.com/uist-labs/assay/tree/v0.6.2 - a card is a frozen "
               "certification record, so the link must pin the exact certifying code.",
               file=sys.stderr)
 
@@ -315,6 +416,7 @@ def load_config(env: Mapping[str, str]) -> RunConfig:
         gpu_mem_util=float(env.get("ASSAY_GPU_MEM_UTIL", "0.85")),
         tier=tier,
         eval_limit=eval_limit,
+        max_model_len=derive_max_model_len(recipe, env),
         pristine=pristine,
     )
 
@@ -369,8 +471,17 @@ def resolve_mount(cfg: RunConfig, exists=os.path.exists) -> RunConfig:
 
 
 def require_secret(env: Mapping[str, str], key: str) -> str:
-    """Fetch a secret from env; raise if absent. Caller must never persist the value."""
-    value = env.get(key)
+    """Fetch a secret from env; raise if absent. Caller must never persist the value.
+
+    Edge whitespace is stripped (F-043): a trailing newline/CR from a key file,
+    embedded verbatim into a pod's env, malforms every in-pod Bearer header into
+    the same 403-forever signature as the 07-28 drill - from one stray byte.
+    Interior whitespace cannot be repaired safely, so it fails loud at $0."""
+    value = (env.get(key) or "").strip()
     if not value:
         raise ValueError(f"{key} is required (inject via runtime env, never on disk)")
+    if any(c.isspace() for c in value):
+        raise ValueError(
+            f"{key} contains embedded whitespace - re-copy the key material; a "
+            "malformed secret embeds as a pod env that fails every API call")
     return value

@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 
+from assay import manifest
+
 
 def _read_mtime(path: str) -> float | None:
     """Modification time of `path` in seconds, or None if it does not exist yet /
@@ -109,12 +111,18 @@ class StallWatchdog:
 
     def __init__(self, signals, on_stall, *, threshold, interval=30.0,
                  heartbeat=None, clock=time.monotonic, sleep=None,
-                 beat_interval=600.0):
+                 beat_interval=600.0, fatal_check=None):
         self.signals = list(signals)
         self.on_stall = on_stall
         self.threshold = float(threshold)
         self.interval = interval
         self.heartbeat = heartbeat
+        # F-009 D6: an independent, unconditional check consulted FIRST every tick.
+        # A non-None string is a TERMINAL fact (e.g. an uncorrected ECC error under
+        # the D3 gate policy) - it aborts on the tick it is detected, never waiting
+        # for the stall threshold (that timer answers a different question: "has
+        # everything gone quiet", not "is this measurement already unsalvageable").
+        self.fatal_check = fatal_check
         self.clock = clock
         # Rate limit for the "progress" heartbeat emit - default 10 min, matched
         # to the tick interval's ~30s: an emit-per-tick would hold the Heartbeat
@@ -127,9 +135,42 @@ class StallWatchdog:
         self._sleep = sleep  # None -> use self._stop.wait (interruptible)
         self._thread = None
         self._killed = False
+        # whole-branch review FIX 3 / F-047: evaluate.py's dead-child headline
+        # needs to know not just THAT the watchdog killed the eval but WHY, so
+        # it can distinguish a hardware fault (ECC_VOID) from a plain stall
+        # rather than always suggesting the stall-threshold knob. Public by
+        # design (unlike the pre-existing `_killed`, which the F-016 fix meant
+        # to expose but never did - the getattr in evaluate.py read a `killed`
+        # attribute that was never set).
+        self.killed_reason: str | None = None
+
+    def _abort(self, reason: str) -> bool:
+        """Single reporting + kill path shared by BOTH abort routes (fatal_check
+        and plain stall-timeout) - the reason plumbing is parameterized here rather
+        than duplicated per route. Reporting goes through the two surfaces the
+        reader pod already exfiltrates: the heartbeat log (self.heartbeat, same
+        object/file the progress beat above already writes to) and stderr, which
+        log_tee tees into the raw pod log (`<job> 2>&1 | log_tee ...` - see
+        module docstring) exactly like the existing ASSAY_STALL_SECONDS warnings
+        below. `on_stall` itself (the actual kill mechanics, e.g. `_kill_stalled`)
+        is called unchanged - this does not touch or duplicate that code."""
+        print(f"assay.watchdog: {reason}", file=sys.stderr)
+        if self.heartbeat is not None:
+            try:
+                self.heartbeat.emit("stall", reason)
+            except Exception:
+                pass  # a raised error can never break the tick
+        self._killed = True
+        self.killed_reason = reason
+        self.on_stall()
+        return True
 
     def _tick(self) -> bool:
         now = self.clock()
+        if self.fatal_check is not None:
+            reason = self.fatal_check()
+            if reason is not None:
+                return self._abort(reason)
         available = 0
         stalled = 0
         progressed_any = False
@@ -161,9 +202,9 @@ class StallWatchdog:
                 except Exception:
                     pass  # best-effort - a raised error can never break the tick
         if self.threshold > 0 and available > 0 and stalled == available:
-            self._killed = True
-            self.on_stall()
-            return True
+            return self._abort(
+                f"watchdog stall - every available signal flat past "
+                f"threshold ({self.threshold:g}s)")
         return False
 
     def _run(self):  # pragma: no cover - thread body, logic tested via _tick
@@ -310,9 +351,35 @@ def stall_drill_warning(env) -> str | None:
             "the kill, or lower ASSAY_STALL_SECONDS.")
 
 
-def build_eval_watchdog(child_pid, raw_log_path, heartbeat, env):  # pragma: no cover
+def _ecc_fatal_check(begin: tuple[int, int]):
+    """F-009 D6: closure over the begin-capture ECC baseline. Reads the CURRENT
+    counters on every tick; a positive uncorrected delta is a terminal fact under
+    the D3 gate policy (any uncorrected error voids the measurement window), so it
+    fires the fatal-abort path instead of waiting for a stall. An unreadable
+    current read (None) returns None (silent, not fatal) - a mid-run flake merely
+    loses earliness, since the end-of-window capture in manifest.finalize() still
+    voids on a not-captured verdict; it can never turn a real error into a false
+    clean because the delta arithmetic only ever fires on an actual positive read."""
+    def _check():
+        cur = manifest.read_ecc_counters()
+        if cur is None:
+            return None
+        delta = cur[0] - begin[0]
+        if delta > 0:
+            return f"ECC_VOID: uncorrected errors during measurement ({delta})"
+        return None
+    return _check
+
+
+def build_eval_watchdog(child_pid, raw_log_path, heartbeat, env,
+                        ecc_begin=None):  # pragma: no cover
     """Production factory: after os.setpgid(0,0) in the child, its pgid == child_pid.
-    ASSAY_STALL_SECONDS (default 1800; 0 == limitless) sets the threshold."""
+    ASSAY_STALL_SECONDS (default 1800; 0 == limitless) sets the threshold.
+
+    ecc_begin: the begin-capture's (uncorrected, corrected) counter tuple, or None.
+    None disarms the mid-run ECC fail-fast entirely (F-009 D6) - the caller (job.py)
+    passes it only when the hardware's ecc_supported is True; ECC-absent hardware
+    has nothing to poll and nothing to void."""
     drill = stall_drill_warning(env)
     if drill:
         print(drill, file=sys.stderr)
@@ -337,5 +404,7 @@ def build_eval_watchdog(child_pid, raw_log_path, heartbeat, env):  # pragma: no 
         _Signal("cpu", lambda: _pgid_cpu_jiffies(child_pid),
                 lambda prev, cur: cur > prev),
     ]
+    fatal_check = _ecc_fatal_check(ecc_begin) if ecc_begin is not None else None
     return StallWatchdog(signals, lambda: _kill_stalled(child_pid),
-                         threshold=threshold, heartbeat=heartbeat)
+                         threshold=threshold, heartbeat=heartbeat,
+                         fatal_check=fatal_check)

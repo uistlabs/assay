@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from assay import __version__
 from assay.config import GateThresholds, RunConfig
 from assay.gate import GateResult, render_delta_table
+from assay.manifest import ManifestV1
 from assay.recipes import Recipe
 
 # Measured through assay's own gate. Bump ONLY as more arches are validated; never claim an
@@ -75,6 +76,76 @@ def _scheme_bullets(scheme: str) -> list[str]:
         "perplexity bar at +12.55% and was rejected. You get almost all the compression at a "
         "quality cost this card measures rather than estimates.",
     ]
+
+
+# (display label, deploy/constraints.txt package name). lm-eval is hyphenated in
+# constraints.txt (its real PyPI/distribution name, what StackPin.name actually
+# holds) though the Python import is lm_eval - a naive same-string lookup would
+# ALWAYS render "not-pinned" for a package that IS pinned, which is exactly the
+# false-negative-honesty class this codebase treats as a real bug (F-009 T8 review).
+_LOAD_BEARING_PINS = (
+    ("torch", "torch"),
+    ("vllm", "vllm"),
+    ("llmcompressor", "llmcompressor"),
+    ("compressed-tensors", "compressed-tensors"),
+    ("lm_eval", "lm-eval"),
+)
+
+# ECC window verdict -> disclosure sentence (F-009 spec Rendering). Every value in
+# manifest.VERDICTS gets an honest sentence here - never a silent fallback to the
+# clean/not-applicable wording. An ECC-void run never reaches publish (the gate
+# fails it, F-009 T6), so in practice only clean/not-applicable manifests are ever
+# rendered by a real publish - but this table does not assume that, because a
+# card-rendering bug should fail loud in a test, not read as a clean run.
+_ECC_VERDICT_SENTENCES = {
+    # VERBATIM per task-8 brief - do not reword.
+    "not-applicable": "This measurement ran on hardware without memory-error "
+                      "protection (no ECC).",
+    "clean": "ECC was enabled for this measurement window; no uncorrected or "
+             "corrected memory errors were observed (verdict: clean).",
+    "void": "ECC recorded an uncorrected memory error during this measurement "
+            "window (verdict: void); the certification for this run is void.",
+    "not-captured": "The ECC error counters for this measurement window could not "
+                    "be read cleanly (verdict: not-captured); no ECC claim is made "
+                    "for this run.",
+}
+
+
+def _stack_manifest_section(manifest: ManifestV1) -> str:
+    """The captured-environment section (F-009): image digest, GPU + VRAM + ECC
+    line, driver/CUDA, the five load-bearing pins, and the ECC window verdict.
+    Public copy register: plain rows, no bold-parallel bullets, no emoji, ASCII
+    only, ' - ' never an em-dash.
+
+    A pin missing from manifest.stack (e.g. an image-only pin excluded from a dev
+    capture) renders "not-pinned" rather than a KeyError - the section must never
+    crash on an incomplete manifest."""
+    hw = manifest.hardware
+    if hw.ecc_supported:
+        ecc_state = "enabled" if hw.ecc_enabled else "disabled"
+    else:
+        ecc_state = "not supported"
+    observed = {p.name: p.observed for p in manifest.stack}
+    pin_rows = "\n".join(
+        f"| {label} | {observed.get(stack_name, 'not-pinned')} |"
+        for label, stack_name in _LOAD_BEARING_PINS)
+    ecc_sentence = _ECC_VERDICT_SENTENCES.get(
+        manifest.ecc_window.verdict,
+        f"ECC verdict for this measurement window: {manifest.ecc_window.verdict}.")
+    return "\n".join([
+        "## Measurement environment",
+        "",
+        "The evaluation numbers above were captured in the following environment.",
+        "",
+        "| field | value |",
+        "|---|---|",
+        f"| image | `{manifest.image}` |",
+        f"| GPU | {hw.gpu_name}, {hw.vram_total_mib} MiB VRAM, ECC {ecc_state} |",
+        f"| driver / CUDA | {hw.driver_version} / {hw.cuda_driver} |",
+        pin_rows,
+        "",
+        ecc_sentence,
+    ])
 
 
 def _citation_section(runcfg: RunConfig) -> str:
@@ -204,7 +275,28 @@ def _scope_note(recipe: Recipe, result: GateResult) -> str:
         "an earlier run: that would fold stack drift into the measurement.")
 
 
-def _statistical_notes(recipe: Recipe, result: GateResult, gate: GateThresholds) -> list[str]:
+def _context_length_bullet(runcfg: RunConfig) -> list[str]:
+    """The evaluation context length disclosure bullet, shared by both the
+    point-gated and significance-gated paths of `_statistical_notes` - it used to
+    exist verbatim in both branches, a public-card string duplicated in two
+    places that WILL drift the next time either copy is edited. Returns [] when
+    max_model_len is None (native context, nothing to disclose).
+
+    Wording derivation assumes the non-override path: max_model_len is
+    recipe-derived (recipe's generation cap plus prompt headroom). An override
+    run (ASSAY_MAX_MODEL_LEN set) is non-pristine and therefore dry-run only, so
+    this wording never reaches a published card under an overridden value."""
+    if runcfg.max_model_len is None:
+        return []
+    return [f"- **Evaluation context length:** `max_model_len={runcfg.max_model_len}` "
+            "on BOTH eval sides, derived from the recipe's generation cap plus prompt "
+            "headroom. Perplexity is computed over rolling windows of this length, so "
+            "perplexity values compare across certifications only at the same context "
+            "length; the baseline-vs-quantized delta on THIS card is unaffected (both "
+            "sides use identical windows)."]
+
+
+def _statistical_notes(recipe: Recipe, result: GateResult, gate: GateThresholds, runcfg: RunConfig) -> list[str]:
     """Significance-gate honesty block: what the gate could and could not have caught.
 
     Replaces the old "power varies" note, which named one task as power-limited and
@@ -215,11 +307,13 @@ def _statistical_notes(recipe: Recipe, result: GateResult, gate: GateThresholds)
 
     What replaces it is checkable rather than reassuring: per task, the observed drop the
     gate would have flagged. That turns the card into a stated non-inferiority claim a
-    reader can verify against the table's own stderr column."""
+    reader can verify against the table's own stderr column.
+
+    Also emits evaluation context length disclosure (when max_model_len is capped) on both
+    point-gated and significance-gated paths."""
+    # For point gates, only disclose context length if capped; no significance prose
     if gate.k_stderr is None:
-        # Point gates state their bar directly in the certification criteria
-        # (max_single_drop_pts IS the flag threshold); nothing to add here.
-        return []
+        return _context_length_bullet(runcfg)
     scored = [d for d in result.accuracy_deltas if d.combined_stderr is not None]
     if not scored:
         return []
@@ -291,17 +385,22 @@ def _statistical_notes(recipe: Recipe, result: GateResult, gate: GateThresholds)
         "independent. We accept those odds in the withholding direction, since a false alarm "
         "costs us a release while a missed regression would cost you a bad checkpoint.",
         gen_note,
+        *_context_length_bullet(runcfg),
     ]
 
 
-def build_model_card(runcfg: RunConfig, result: GateResult) -> str:
+def build_model_card(runcfg: RunConfig, result: GateResult, manifest: ManifestV1) -> str:
     """HF model card: overview -> vLLM usage -> creation -> evaluation -> certification.
 
     Structure mirrors the compressed-tensors community standard (RedHatAI cards), plus
     UIST Labs' differentiator: the checkpoint is published ONLY because it cleared a
     hard, stated accuracy gate, and the card shows the real measured deltas - trust
     built on facts confirmed by analysis, applied to every UIST quantization release.
-    Plain ASCII only (published file). All numbers come from `result` / runcfg at publish."""
+    Plain ASCII only (published file). All numbers come from `result` / runcfg at publish.
+
+    `manifest` is REQUIRED (no default): the card's measurement-environment section
+    (F-009) is not optional debt to backfill later - build-it-right, no None-default
+    for a publish-integrity input."""
     recipe = runcfg.recipe
     name = runcfg.checkpoint_repo.split("/")[-1]
     scheme = recipe.quant_scheme
@@ -401,6 +500,8 @@ def build_model_card(runcfg: RunConfig, result: GateResult) -> str:
         "",
         render_delta_table(result, gate),
         "",
+        _stack_manifest_section(manifest),
+        "",
         "## Methodology and limitations",
         "",
         "- **Apples-to-apples deltas.** The bf16 baseline and this checkpoint were evaluated "
@@ -409,7 +510,7 @@ def build_model_card(runcfg: RunConfig, result: GateResult) -> str:
         "change from the original, honestly.",
         mode_note,
         _scope_note(recipe, result),
-        *_statistical_notes(recipe, result, gate),
+        *_statistical_notes(recipe, result, gate, runcfg),
         # "small benchmark sets vary run to run" is false for a greedy/loglikelihood
         # battery on a fixed stack, where a rerun reproduces the score exactly. The real
         # and battery-independent mechanism is finite-item sampling noise.
@@ -454,7 +555,7 @@ def build_model_card(runcfg: RunConfig, result: GateResult) -> str:
 
 
 def publish_if_passed(runcfg: RunConfig, out_dir: str, result: GateResult, token: str,
-                      hb=None, api=None, *, dry_run: bool) -> bool:
+                      hb=None, api=None, *, dry_run: bool, manifest: ManifestV1) -> bool:
     """Push to HF only on a passing gate. Returns whether it published.
     dry_run (non-pristine run: any non-cert tier, or any runtime override on a cert-tier
     run): build the model card (exercises card generation) but never upload - returns
@@ -463,7 +564,12 @@ def publish_if_passed(runcfg: RunConfig, out_dir: str, result: GateResult, token
     dry_run is KEYWORD-ONLY and REQUIRED on purpose. It used to default to False - the
     live, irreversible action - so a caller that simply forgot it would upload for real.
     Publish-integrity bits are never defaulted; keyword-only additionally stops it being
-    supplied positionally by accident as the parameter list grows."""
+    supplied positionally by accident as the parameter list grows.
+
+    manifest is KEYWORD-ONLY and REQUIRED for the same reason (F-009 T8): it feeds both
+    the card's measurement-environment section and the standalone manifest.json staged
+    into the upload folder, so a caller that omits it cannot silently publish without
+    provenance."""
     if not result.passed:
         if hb:
             hb.emit("publish", "gate FAILED - not publishing")
@@ -471,7 +577,14 @@ def publish_if_passed(runcfg: RunConfig, out_dir: str, result: GateResult, token
 
     card_path = os.path.join(out_dir, "README.md")
     with open(card_path, "w", encoding="ascii", errors="replace") as fh:
-        fh.write(build_model_card(runcfg, result))
+        fh.write(build_model_card(runcfg, result, manifest))
+
+    # manifest.json rides the same staged out_dir as README.md, BEFORE upload_folder,
+    # so a single upload_folder call publishes both (spec D2/Rendering). Written on
+    # dry-run too, same as the card - a dry run still exercises real generation.
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="ascii", errors="replace") as fh:
+        fh.write(manifest.to_json())
 
     if dry_run:
         if hb:
